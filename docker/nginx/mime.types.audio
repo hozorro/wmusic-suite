@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# 音频/歌词类型补充。
+# nginx 官方 conf/mime.types 的音频部分只有 5 条：
+#     audio/midi mid midi kar; audio/mpeg mp3; audio/ogg ogg;
+#     audio/x-m4a m4a; audio/x-realaudio ra;
+# 缺 flac / wav / opus / aac / ape / dsf 等 —— 缺失后缀会落到 default_type，
+# 再叠加 X-Content-Type-Options: nosniff，浏览器会直接拒绝播放。
+#
+# http 层允许多个 types 块并存且有累加语义，同名扩展后出现的覆盖先出现的。
+# 所以这里只需 include 在官方 mime.types 之后即可。
+# ---------------------------------------------------------------------------
+types {
+    # 无损：本项目主要的两类文件之一
+    # 用 IANA 标准名 audio/flac，不要写旧的 audio/x-flac
+    # （同名扩展后出现的会覆盖前面的，所以这里只允许一条 flac 记录）
+    audio/flac                                       flac;
+
+    # PCM / 未压缩
+    audio/wav                                        wav;
+    audio/x-wav                                      wave;
+    audio/x-aiff                                     aif aifc aiff;
+
+    # 有损 & 流媒体常见封装
+    audio/aac                                        aac;
+    audio/mp4                                        m4b;
+    audio/x-m4a                                      m4a;
+    audio/opus                                       opus;
+    audio/ogg                                        oga spx;
+    audio/mpeg                                       mp2 mpga mp1;
+
+    # 无损 / 高解析小众格式
+    audio/x-ape                                      ape mac;
+    audio/x-dsf                                      dsf dff;
+    audio/x-wavpack                                  wv;
+    audio/x-shorten                                  shn;
+    audio/x-tta                                      tta;
+    audio/x-alac                                     alac;
+    audio/x-ms-wma                                   wma;
+
+    # 播放列表 / 歌词 / 音轨索引
+    audio/x-scpls                                    pls;
+    audio/mpegurl                                    m3u m3u8;
+    audio/x-cue                                      cue;
+}
+

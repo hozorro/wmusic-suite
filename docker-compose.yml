@@ -1,0 +1,216 @@
+# musicbase-suite 一体化部署栈
+# ---------------------------------------------------------------------------
+# 三个子项目各自保留 git 仓库（以 submodule/subtree 挂载到本仓库根目录），
+# 本文件负责把它们编排成一个服务栈：postgres + FastAPI + nginx(双前端)
+#
+# 所有构建上下文都是「本仓库根目录」，方便一个 Dockerfile 里 COPY 多个子项目。
+# 用法：
+#   cp .env.example .env && vim .env
+#   docker compose build
+#   docker compose up -d
+# ---------------------------------------------------------------------------
+
+name: musicbase
+
+services:
+
+  # ---------------------------- PostgreSQL -------------------------------
+  db:
+    image: postgres:17-alpine
+    container_name: musicbase-db
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-musicbase}"
+      POSTGRES_USER: "${POSTGRES_USER:-musicbase}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}"
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: "${TZ:-Asia/Shanghai}"
+      LANG: C.UTF-8
+      # 中文排序：如需按拼音排序可用 zh_CN.UTF-8，但注意体积与 ICU 版本
+      # POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=zh-CN"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 固定 IP：数据库连接串里写的是服务名 db，固定后可避免重建容器时连接串解析漂移
+    networks:
+      musicbase:
+        ipv4_address: ${DB_IPV4:-172.28.0.11}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-musicbase} -d ${POSTGRES_DB:-musicbase}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ------------------------- FastAPI 后端 musicbase -----------------------
+  api:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+      args:
+        PYTHON_VERSION: "3.13"
+        # 需要 ffmpeg（转码 / 从视频抽封面 / 生成波形）时改为 true
+        INSTALL_FFMPEG: "${INSTALL_FFMPEG:-false}"
+    image: musicbase/api:${IMAGE_TAG:-latest}
+    container_name: musicbase-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    # ------------------------------------------------------------------
+    # 配置注入：两份文件，职责互不重叠
+    #
+    #   顶层 .env          ——【编排参数】宿主机路径、端口、数据库凭据、构建开关。
+    #                        只被本文件的 ${} 引用，**不注入任何容器**。
+    #   musicbase/.env     ——【后端应用配置】SECRET_KEY / ACOUSTID_API_KEY /
+    #                        NETEASE_* / DEBUG 等，与后端源码同处一室。
+    #                        经下面的 env_file 进容器，后端 Settings 直接读。
+    #
+    # 后端的真实字段清单见 musicbase/app/core/config.py，别按 .env.example 的
+    # 注释猜字段：那里的 DB_HOST / MUSIC_LIBRARY_PATH 等是「本地开发值」，
+    # 进容器后会被本段 environment 覆盖成容器内视角的值。
+    #
+    # format: raw 让 Compose 不做 ${} 插值，从而与本地 python-dotenv 的读取
+    # 行为严格一致 —— 否则同一个 SECRET_KEY 里带 $ 时，本地跑和容器跑会得到
+    # 两个不同的值。需要 Compose >= 2.30；版本偏低就删掉 format 行，并注意
+    # 值里的 $ 必须写成 $$（只对容器生效，本地反而会多出反斜杠）。
+    # ------------------------------------------------------------------
+    env_file:
+      - path: musicbase/.env
+        format: raw
+    # ------------------------------------------------------------------
+    # 本段【只放两类东西】：
+    #   (a) 值必须为「容器内部视角」的编排契约（路径、服务名、监听地址）
+    #   (b) 需要 compose 插值搬运的部署参数（从顶层 .env 读值再显式送进来）
+    #
+    # 判断标准：这个值换了台主机要不要改？
+    #   要改  -> 放顶层 .env，这里用 ${} 搬运（PUID / TZ / 开关等）
+    #   不改  -> 直接写死在这里（容器路径、DB_HOST=db、HOST=0.0.0.0）
+    # 不属于这两类的一律不写，交给 musicbase/.env。
+    # ------------------------------------------------------------------
+    environment:
+      # ---- (a1) 容器内部路径：与下方 volumes 一一对应的契约 ----
+      MUSIC_LIBRARY_PATH: /music
+      # ⚠️ MEDIA_ROOT 是「媒体文件根目录」，下列目录全部由它派生，而且是只读
+      #    property —— 想用环境变量单独设 TEMP_DIR / STAGING_DIR / ARTWORK_DIR
+      #    是无效的，后端 config.py 里根本没有这几个字段：
+      #      ARTWORK_DIR       = MEDIA_ROOT/artwork
+      #      TEMP_DIR          = MEDIA_ROOT/uploads/temp        （上传落盘）
+      #      STAGING_DIR       = MEDIA_ROOT/uploads/staging     （待归档暂存区）
+      #      PLAYLISTS_TMP_DIR = MEDIA_ROOT/playlists/tmp
+      MEDIA_ROOT: /var/lib/musicbase/media
+      LOG_DIR: /var/lib/musicbase/logs          # 默认是 /app/logs，容器重建即丢
+      # 必须绝对路径 + 落在持久化卷，否则容器重建后网易云登录态丢失
+      NETEASE_COOKIES_FILE: /var/lib/musicbase/media/netease_cookies.json
+      # ---- (a2) 与 nginx 强耦合：X-Accel-Redirect 的内部前缀 ----
+      # stream.py 里 inner = MUSIC_STATIC_PREFIX + quote(track.path)，
+      # 必须与 music.conf 的 `location ^~ /media/`（alias /music/）**完全一致**
+      # 含结尾斜杠，否则 nginx 找不到 location，播放 404。
+      # 后端默认值是 /music（对应它原生部署的 nginx），容器里必须改。
+      MUSIC_STATIC_PREFIX: /media/
+      # ---- (a3) 服务发现与监听 ----
+      HOST: "0.0.0.0"                           # 容器内监听所有网卡（对外端口由 web 的 ports 决定）
+      PORT: "8000"                              # 必须与 Dockerfile CMD 的 --port 一致
+      DB_HOST: db                               # 容器内是服务名，绝不能写 127.0.0.1
+      DB_PORT: "5432"
+      # ⚠️ 刻意不设 DATABASE_URL：后端 config.py 里 scheme 写死
+      #    postgresql+asyncpg，丢给它一个 psycopg 风格的 URL 会直接连不上。
+      #    留空时后端会用下面的 DB_* 自行组装（validator 负责拼接）。
+      # ---- (b) 从顶层 .env 插值搬运的部署参数 ----
+      DB_USER: "${POSTGRES_USER:-musicbase}"    # 复用 db 服务的凭据，避免填两遍
+      DB_PASSWORD: "${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}"
+      DB_NAME: "${POSTGRES_DB:-musicbase}"
+      TZ: "${TZ:-Asia/Shanghai}"
+      PUID: "${PUID:-1000}"                     # 必须等于宿主机音乐库目录的属主
+      PGID: "${PGID:-1000}"
+      UMASK: "${UMASK:-022}"
+      RUN_MIGRATIONS: "${RUN_MIGRATIONS:-true}"
+      WAIT_FOR_DB: "${WAIT_FOR_DB:-true}"
+      UVICORN_WORKERS: "${UVICORN_WORKERS:-1}"
+      CHOWN_LIBRARY: "${CHOWN_LIBRARY:-false}"
+    volumes:
+      # 音乐库：宿主机目录 -> /music（可写，因为要做标签编辑、文件整理、归档入库）
+      - "${MUSIC_DIR:?请在 .env 中设置 MUSIC_DIR}:/music"
+      # 媒体根：artwork / uploads/temp / uploads/staging 都在它下面。
+      # ⚠️ 必须与 MUSIC_DIR 落在【同一物理卷】——归档是 shutil.move，
+      #    跨设备时它会静默降级成「复制后删除」：大文件慢，中断还会留半个文件。
+      #    make check 会用 stat 设备号比对两者，不等就报错。
+      - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/var/lib/musicbase/media"
+      # artwork 单独映射时，这一行会覆盖 MEDIA_ROOT/artwork 子目录。
+      # 不需要独立目录（用 MEDIA_DIR/artwork 即可）时删掉本行。
+      - "${ARTWORK_DIR:?请在 .env 中设置 ARTWORK_DIR}:/var/lib/musicbase/media/artwork"
+      - app_data:/var/lib/musicbase/logs
+    # 固定 IP：见文件末尾 networks.musicbase 的说明（避免 api 重启换 IP 后 nginx 502）
+    networks:
+      musicbase:
+        ipv4_address: ${API_IPV4:-172.28.0.10}
+    logging: *default-logging
+
+  # ------------------- nginx：双前端静态 + API 反代 + 媒体分发 -------------
+  web:
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+      args:
+        NODE_VERSION: "22"
+        NGINX_VERSION: "1.27"
+        # 路由基座，必须与 nginx conf.d/music.conf 中的 location 一致
+        PLAYER_BASE: "/"
+        MAN_BASE: "/admin/"
+        # 透传给前端的运行时配置
+        VITE_API_BASE: "/api"
+        VITE_MEDIA_BASE: "/media"
+        VITE_ARTWORK_BASE: "/artwork"
+        VITE_ENABLE_PWA: "${VITE_ENABLE_PWA:-true}"
+    image: musicbase/web:${IMAGE_TAG:-latest}
+    container_name: musicbase-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      # nginx 只读挂载：音频/封面只做下载分发，写操作一律走 API
+      # 路径必须与 music.conf 里的 alias 一致（/media/ -> /music/，/artwork/ -> ...）
+      - "${MUSIC_DIR:?请在 .env 中设置 MUSIC_DIR}:/music:ro"
+      - "${ARTWORK_DIR:?请在 .env 中设置 ARTWORK_DIR}:/var/lib/musicbase/media/artwork:ro"
+    networks:
+      - musicbase
+    logging: *default-logging
+
+# ---------------------------------------------------------------------------
+# 自定义 bridge 网络 + 静态 IPAM
+#
+# 为什么给 api / db 固定 IP：
+#   nginx 的 upstream server 若在配置里写主机名，只会在【nginx 启动时解析一次】，
+#   此后一直用缓存的 IP。而 Docker 容器每次重建都会拿到新 IP，
+#   于是 `docker compose restart api` 之后，nginx 还在连旧 IP -> 502 Bad Gateway，
+#   且只有重启 nginx 容器才能恢复。这是 nginx + Docker DNS 最经典的坑。
+#   把 api 的 IP 钉死后，服务名解析出来的永远是同一个地址，问题从根上消失。
+#
+# 子网选择：默认用了 172.28.0.0/16。若与宿主机上已有网络冲突
+#   （ docker network inspect $(docker network ls -q) | grep Subnet ），
+#   在 .env 里改 MUSICBASE_SUBNET，并相应调整 DB_IPV4 / API_IPV4。
+#
+# ⚠️ 网络配置变更不会热生效：改完必须 docker compose down && docker compose up -d
+#    （compose 检测到网络配置变化会重建网络）
+# ---------------------------------------------------------------------------
+networks:
+  musicbase:
+    name: musicbase-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: "${MUSICBASE_SUBNET:-172.28.0.0/16}"
+
+volumes:
+  pgdata:
+  app_data:      # 后端日志（LOG_DIR）；媒体文件不在这里，走 MEDIA_DIR 绑定宿主目录
+
