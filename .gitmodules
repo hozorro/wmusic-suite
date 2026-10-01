@@ -1,0 +1,12 @@
+[submodule "musicbase"]
+	path = musicbase
+	url = git@github.com:hozorro/wmusicbase.git
+	branch = main
+[submodule "musicplayer"]
+	path = musicplayer
+	url = git@github.com:hozorro/wmusicplayer.git
+	branch = main
+[submodule "musicman"]
+	path = musicman
+	url = git@github.com:hozorro/wmusicman.git
+	branch = main
