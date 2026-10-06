@@ -238,6 +238,81 @@ else
     echo "    注意：这项检测依赖后端源码，别只用 .env.example 判断字段是否存在"
 fi
 
+echo "== 音频指纹工具（fpcalc）"
+# 后端上传流程会用 pyacoustid 生成指纹，pyacoustid 内部执行 fpcalc 可执行文件：
+#     acoustid.py:  fpcalc = os.environ.get(FPCALC_ENVVAR, FPCALC_COMMAND)
+# 所以镜像里必须有它，否则上传时指纹步骤会 NoBackendError。
+BD=docker/backend/Dockerfile
+grep -qE "COPY --from=fpcalc .*/usr/local/bin/fpcalc" "$BD" \
+    && ok "fpcalc 已装进镜像 PATH" \
+    || err "Dockerfile 未安装 fpcalc：后端生成音频指纹会 NoBackendError"
+grep -q "FPCALC=/usr/local/bin/fpcalc" "$BD" \
+    && ok "已显式声明 FPCALC（取值确定化，不再依赖 PATH 查找）" \
+    || echo "  ! 未显式设置 FPCALC：acoustid 会按 PATH 找 'fpcalc'，一般也能用"
+grep -q "fpcalc -version" "$BD" \
+    && ok "构建期有 fpcalc 自检（架构不匹配/缺库会在 build 阶段就暴露）" \
+    || echo "  ! 未做构建期自检：fpcalc 装错架构要等第一次上传才发现"
+grep -q "TARGETARCH" "$BD" \
+    && ok "fpcalc 按目标架构取二进制（amd64 / arm64）" \
+    || echo "  ! 未处理多架构：NAS 若为 arm64 会装到 x86_64 二进制而无法执行"
+# 反模式：apt 的 libchromaprint-tools 会连带装上 libchromaprint.so.1，
+# 使 pyacoustid 的 have_chromaprint 变 True，从而【跳过 fpcalc 改走 audioread 分支】，
+# 而 audioread 还需要 gstreamer 或 ffmpeg 可执行文件才能解码 —— fpcalc 就白装了。
+if sed 's/#.*//' "$BD" | grep -qE "apt-get install.*libchromaprint"; then
+    err "Dockerfile 用 apt 装了 libchromaprint，会让指纹走 audioread 分支而绕过 fpcalc：
+       请改用 chromaprint 官方静态 fpcalc（见 Dockerfile 的 fpcalc stage），
+       并确保不安装 libchromaprint.so.1。"
+else
+    ok "未安装 libchromaprint.so.1（不会劫持 pyacoustid 的 fpcalc 分支）"
+fi
+
+echo "== 音乐库监控服务（watcher）"
+# 后端有两套 watcher 实现，互斥：
+#   app/background/watcher.py          独立进程 ← 容器里用这个
+#   app/background/watcher_manager.py  进程内，由管理端 /startwatcher 触发（开发用）
+# 同时启用 → 同一个新文件被处理两次 → 重复 Track / 并发写库。
+svc_block() {
+    awk -v want="$1" '
+        /^  [A-Za-z0-9_-]+:/ { svc=$0; sub(/:.*/,"",svc); gsub(/^[ \t]+|[ \t]+$/,"",svc); inblk=(svc==want); next }
+        inblk { print }
+    ' docker-compose.yml
+}
+if ! grep -qE "^  watcher:" docker-compose.yml; then
+    err "compose 里没有 watcher 服务：音乐库变动不会被自动入库（只能手动全量扫描）"
+else
+    ok "compose 已定义 watcher 服务"
+    sed 's/#.*//' < <(svc_block watcher) | grep -qE 'command:.*app\.background\.watcher' \
+        && ok "以独立进程方式启动（python -m app.background.watcher）" \
+        || err "watcher 的 command 不是 app.background.watcher"
+    sed 's/#.*//' < <(svc_block watcher) | grep -q '<<: \*api-env' \
+        && ok "复用 api 的环境锚点（两个进程的配置不会各自漂移）" \
+        || err "watcher 未复用 api 的环境定义：两处配置会各自演化，迟早不一致"
+    sed 's/#.*//' < <(svc_block watcher) | grep -qE 'RUN_MIGRATIONS:[[:space:]]*"false"' \
+        && ok "watcher 不执行数据库迁移（迁移只由 api 跑一次）" \
+        || err "watcher 会与 api 同时 alembic upgrade head，可能互相撞锁"
+    sed 's/#.*//' < <(svc_block watcher) | grep -q "/var/lib/musicbase/logs/watcher" \
+        && ok "watcher 日志目录已与 api 分离" \
+        || err "watcher 与 api 共用 LOG_DIR：logger.py 的 RotatingFileHandler
+       轮转不是多进程安全的，两个进程写同一个 app.log 会丢日志、轮转错乱。"
+    sed 's/#.*//' < <(svc_block watcher) | grep -q "disable: true" \
+        && ok "已关闭 watcher 的 HTTP 健康检查" \
+        || err "watcher 继承了镜像的 /healthz 健康检查，它会永远显示 unhealthy"
+fi
+if [ -f musicbase/app/background/watcher.py ]; then
+    if grep -q "PollingObserver" musicbase/app/background/watcher.py; then
+        ok "watcher.py 可按 WATCH_MODE 切换 Observer/PollingObserver"
+    else
+        echo "  ⚠ watcher.py 里只有 Observer（inotify），WATCH_MODE 配了也不生效："
+        echo "    Docker Desktop(Windows/macOS) 的 bind mount 与 NFS/SMB 上收不到 inotify 事件，"
+        echo "    容器会正常启动并打印 'Watcher started'，但文件变动永远不触发 —— 静默失效。"
+        echo "    补丁见 README「监控模式」一节（换成 PollingObserver）。"
+    fi
+fi
+if [ -f musicbase/app/api/v1/admin/scan.py ] && grep -q "startwatcher" musicbase/app/api/v1/admin/scan.py; then
+    echo "  ! 后端保留了 /api/v1/admin/startwatcher（进程内 watcher，开发用）"
+    echo "    独立进程模式下请【不要】调用它，否则同一文件会被两个 watcher 各入库一次"
+fi
+
 echo "== env_file 的解析模式"
 # format: raw 让 Compose 不做 ${} 插值，从而与本地 python-dotenv 的读取行为严格一致
 # （否则同一个带 $ 的 SECRET_KEY，本地跑和容器跑会得到两个不同的值）。

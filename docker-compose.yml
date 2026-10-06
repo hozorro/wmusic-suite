@@ -48,14 +48,24 @@ services:
         max-file: "3"
 
   # ------------------------- FastAPI 后端 musicbase -----------------------
+  # ⚠️ 下面用 YAML 锚点（&api-build / &api-env-file / &api-env / &api-volumes）
+  #    把 api 的「构建 / 配置 / 挂载」定义成模板，watcher 服务直接复用（*xxx）。
+  #    理由：watcher 与 api 是同一份代码、同一份配置。任何一处抄两遍，都会在
+  #    将来某次只改了一边时，出现「两个进程按不同配置运行」的幽灵故障。
+  #    锚点挂在 api 上而不是写成 x- 扩展字段，是为了让本文件里 api 段依旧完全
+  #    字面可读 —— scripts/check.sh 的静态解析依赖这一点。
   api:
-    build:
+    build: &api-build
       context: .
       dockerfile: docker/backend/Dockerfile
       args:
         PYTHON_VERSION: "3.13"
         # 需要 ffmpeg（转码 / 从视频抽封面 / 生成波形）时改为 true
+        # 注意：音频指纹【不】依赖它 —— fpcalc 是自带静态 FFmpeg 的独立二进制
         INSTALL_FFMPEG: "${INSTALL_FFMPEG:-false}"
+        FPCALC_VERSION: "${FPCALC_VERSION:-1.6.1}"
+        # 连不上 GitHub 时填加速前缀，例如 https://ghfast.top/https://github.com
+        FPCALC_MIRROR: "${FPCALC_MIRROR:-}"
     image: musicbase/api:${IMAGE_TAG:-latest}
     container_name: musicbase-api
     restart: unless-stopped
@@ -80,7 +90,7 @@ services:
     # 两个不同的值。需要 Compose >= 2.30；版本偏低就删掉 format 行，并注意
     # 值里的 $ 必须写成 $$（只对容器生效，本地反而会多出反斜杠）。
     # ------------------------------------------------------------------
-    env_file:
+    env_file: &api-env-file
       - path: musicbase/.env
         format: raw
     # ------------------------------------------------------------------
@@ -93,7 +103,8 @@ services:
     #   不改  -> 直接写死在这里（容器路径、DB_HOST=db、HOST=0.0.0.0）
     # 不属于这两类的一律不写，交给 musicbase/.env。
     # ------------------------------------------------------------------
-    environment:
+    # 锚点：watcher 服务用 `<<: *api-env` 复用整段，保证两个进程配置永远一致
+    environment: &api-env
       # ---- (a1) 容器内部路径：与下方 volumes 一一对应的契约 ----
       MUSIC_LIBRARY_PATH: /music
       # ⚠️ MEDIA_ROOT 是「媒体文件根目录」，下列目录全部由它派生，而且是只读
@@ -133,7 +144,8 @@ services:
       WAIT_FOR_DB: "${WAIT_FOR_DB:-true}"
       UVICORN_WORKERS: "${UVICORN_WORKERS:-1}"
       CHOWN_LIBRARY: "${CHOWN_LIBRARY:-false}"
-    volumes:
+    # 锚点：watcher 服务用 *api-volumes 复用（它同样要读写音乐库和 MEDIA_ROOT）
+    volumes: &api-volumes
       # 音乐库：宿主机目录 -> /music（可写，因为要做标签编辑、文件整理、归档入库）
       - "${MUSIC_DIR:?请在 .env 中设置 MUSIC_DIR}:/music"
       # 媒体根：artwork / uploads/temp / uploads/staging 都在它下面。
@@ -149,6 +161,67 @@ services:
     networks:
       musicbase:
         ipv4_address: ${API_IPV4:-172.28.0.10}
+    logging: *default-logging
+
+  # --------------- 音乐库文件监控（watcher，独立进程，复用 api 镜像）---------
+  # 后端自带两套互斥的实现，只能选一套跑：
+  #   ① app/background/watcher.py         独立进程  ← 本服务用这个
+  #   ② app/background/watcher_manager.py 进程内，由管理端 /startwatcher 触发（开发用）
+  # watcher.py 的文件头注释写明了这条约定：
+  #   "If use watcher in separated process, ... disable trigger in the frontend."
+  # ⚠️ 两者同时跑 → 同一个新文件被两个 watcher 各处理一遍 → 重复 Track、并发写库。
+  #    所以本服务启用后，管理端【不要】再点"启动监控"（/api/v1/admin/startwatcher）。
+  #
+  # 为什么不塞进 api 容器用 supervisor 管两个进程：
+  #   Docker 本身就是进程管理器。拆成独立服务后，重启策略、日志（docker logs）、
+  #   资源限制、崩溃恢复都是独立的 —— 监控进程卡死不影响 API，反之亦然。
+  #   后端自带的 deploy/supervisor.conf.template 适用于非容器部署，容器里不需要。
+  watcher:
+    build: *api-build
+    image: musicbase/api:${IMAGE_TAG:-latest}
+    container_name: musicbase-watcher
+    restart: unless-stopped
+    # watcher 收到 SIGTERM 后会先停 observer 再退出（watcher.py 里装了信号处理），
+    # 留足时间避免正在处理的文件被半途掐断
+    stop_grace_period: 20s
+    depends_on:
+      db:
+        condition: service_healthy
+      # 迁移由 api 负责，watcher 只等它启动即可。
+      # 想更严格可改成 service_healthy，但那要求后端已实现 /healthz（见 README）
+      api:
+        condition: service_started
+    # ⚠️ 必须覆盖镜像的 CMD。ENTRYPOINT（entrypoint.sh）保持不变，
+    #    所以 PUID/PGID 降权、等库、日志目录创建这些逻辑与 api 完全一致；
+    #    RUN_MIGRATIONS 已在下面关掉，不会重复跑迁移。
+    command: ["python", "-m", "app.background.watcher"]
+    env_file: *api-env-file
+    environment:
+      # 与 api 复用同一份配置：watcher 读的是同一套 Settings、同一个数据库、
+      # 同一个音乐库和 MEDIA_ROOT，任何一项不一致都会导致两边看到的库不一样
+      <<: *api-env
+      # ---- 以下三项是 watcher 与 api 唯一的差异 ----
+      # (1) 迁移只该跑一次，两个容器同时 alembic upgrade head 会互相撞锁
+      RUN_MIGRATIONS: "false"
+      # (2) 日志分流。后端 logger.py 用 RotatingFileHandler 写死 app.log，而
+      #     RotatingFileHandler 的轮转【不是多进程安全的】：两个进程写同一个
+      #     文件会丢日志、甚至把彼此的文件句柄轮转掉。给 watcher 单独一个目录，
+      #     最终落在同一个 logs 卷里：.../logs/watcher/app.log
+      LOG_DIR: /var/lib/musicbase/logs/watcher
+      # (3) 监控模式。inotify 只在 Linux 直挂真实文件系统时可靠；
+      #     Docker Desktop(Win/Mac) 的 bind mount、以及 NFS/SMB 必须用 polling。
+      #     默认给 polling：它会慢一点，但换任何环境都能工作 —— 而 inotify 在
+      #     这两种场景下【不报错、只是永远不触发】，属于最难查的一类故障。
+      #     ⚠️ 这个变量要生效需要后端先打补丁（watcher.py 目前硬编码 Observer），
+      #     补丁见 README「监控模式」一节 —— 在那之前本项不起作用。
+      WATCH_MODE: "${WATCH_MODE:-polling}"
+    # 容器里没有 HTTP 服务，镜像自带的 /healthz 探测必然失败、会一直显示
+    # unhealthy（并在 compose ps 里制造噪音），故关闭；进程存活交给 restart 策略
+    healthcheck:
+      disable: true
+    volumes: *api-volumes
+    networks:
+      - musicbase
     logging: *default-logging
 
   # ------------------- nginx：双前端静态 + API 反代 + 媒体分发 -------------

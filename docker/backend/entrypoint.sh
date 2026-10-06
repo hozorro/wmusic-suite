@@ -115,8 +115,16 @@ fi
 # UVICORN_WORKERS 来自 .env（部署层）。默认 1：本项目涉及标签改写、文件整理、
 # 归档入库等会写同一个文件的操作，多 worker 会出现两个进程并发写同一首歌。
 # 只有确认长任务都走独立任务队列后，才建议调大。
+#
+# ⚠️ 只对 uvicorn 生效。本镜像还被 watcher 服务复用，它的 CMD 是
+#    `python -m app.background.watcher`；给那个进程追加 --workers 毫无意义
+#    （该模块没有 argparse，参数会被静默丢掉），但启动日志会显示一个并不存在
+#    的 worker 数，排查时误导人。
+RUNS_UVICORN=0
+case " $* " in *uvicorn*) RUNS_UVICORN=1 ;; esac
+
 WORKERS="${UVICORN_WORKERS:-1}"
-if [ "${WORKERS}" != "1" ]; then
+if [ "${RUNS_UVICORN}" = "1" ] && [ "${WORKERS}" != "1" ]; then
     case " $* " in
         *" --workers "*) log "警告: CMD 已带 --workers，忽略 UVICORN_WORKERS=${WORKERS}" ;;
         *) set -- "$@" --workers "${WORKERS}" ;;

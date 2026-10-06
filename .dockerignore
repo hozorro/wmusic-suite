@@ -1,8 +1,8 @@
 # 构建上下文是本仓库根目录，务必排除掉一切不需要进镜像的东西，否则 context 巨大
 **/.git
 **/.gitignore
-# 最关键的一条：本地 .env 里放着真实的密钥/密码，绝不能被 COPY 进镜像。
-# 容器里的配置一律由 compose 的 environment / env_file 注入。
+# ⚠️ 最关键的一条：本地 .env 里放着真实的密钥/密码，绝不能被 COPY 进镜像。
+#    容器里的配置一律由 compose 的 environment / env_file 注入。
 **/.env
 .env
 **/.env.*
@@ -22,4 +22,25 @@
 **/*.log
 **/coverage
 backups
+
+# ---------------------------------------------------------------------------
+# 开发机上的 Windows 版音频工具
+# 后端仓库根目录下有 fpcalc.exe / libchromaprint.dll / libchromaprint.dll.a
+# （本地开发用，后端 .gitignore 第 164 行起也忽略了它们）。
+# ⚠️ 千万别想着 `COPY fpcalc` 把它们搬进 Linux 镜像：那是 PE 格式的可执行文件，
+#    容器里根本跑不起来，报错会是 "exec format error" 或 "fpcalc not found"。
+#    容器内的 fpcalc 由 docker/backend/Dockerfile 的 Stage 2 下载官方 linux
+#    静态二进制（带 sha256 校验），版本由 FPCALC_VERSION 控制。
+# ---------------------------------------------------------------------------
+**/fpcalc.exe
+**/*.dll
+**/*.dll.a
+**/*.exe
+
+# 本机运行产物与凭据，绝不能进镜像层
+**/netease_cookies.json          # 网易云登录 cookie，等同凭据
+**/*.db                          # 开发期的 sqlite 快照（inspect_result.db 等）
+**/*.egg-info
+musicbase/media                  # 本地开发用的媒体目录，容器里由 MEDIA_DIR 挂载
+musicbase/logs                   # 本地日志，容器里写 LOG_DIR 卷
 
