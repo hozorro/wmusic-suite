@@ -81,10 +81,10 @@ echo "== 顶层 .env（编排参数）"
 if [ -f .env ]; then
     ok ".env 存在"
     set -a; source .env; set +a
-    for v in POSTGRES_PASSWORD MUSIC_DIR MEDIA_DIR ARTWORK_DIR; do
+    for v in POSTGRES_PASSWORD MUSIC_DIR MEDIA_DIR; do
         [ -n "${!v:-}" ] && ok "$v 已设置" || err "$v 未设置"
     done
-    for v in MUSIC_DIR MEDIA_DIR ARTWORK_DIR; do
+    for v in MUSIC_DIR MEDIA_DIR; do
         d="${!v:-}"
         [ -n "$d" ] || continue
         if [ -d "$d" ]; then ok "$v 存在 ($d)"; else err "$v 目录不存在: $d"; fi

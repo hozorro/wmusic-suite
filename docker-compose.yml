@@ -120,10 +120,10 @@ services:
       NETEASE_COOKIES_FILE: /var/lib/musicbase/media/netease_cookies.json
       # ---- (a2) 与 nginx 强耦合：X-Accel-Redirect 的内部前缀 ----
       # stream.py 里 inner = MUSIC_STATIC_PREFIX + quote(track.path)，
-      # 必须与 music.conf 的 `location ^~ /media/`（alias /music/）**完全一致**
+      # 必须与 music.conf 的 `location ^~ /music/`（alias /music/）**完全一致**
       # 含结尾斜杠，否则 nginx 找不到 location，播放 404。
       # 后端默认值是 /music（对应它原生部署的 nginx），容器里必须改。
-      MUSIC_STATIC_PREFIX: /media/
+      MUSIC_STATIC_PREFIX: /music/
       # ---- (a3) 服务发现与监听 ----
       HOST: "0.0.0.0"                           # 容器内监听所有网卡（对外端口由 web 的 ports 决定）
       PORT: "8000"                              # 必须与 Dockerfile CMD 的 --port 一致
@@ -155,7 +155,7 @@ services:
       - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/var/lib/musicbase/media"
       # artwork 单独映射时，这一行会覆盖 MEDIA_ROOT/artwork 子目录。
       # 不需要独立目录（用 MEDIA_DIR/artwork 即可）时删掉本行。
-      - "${ARTWORK_DIR:?请在 .env 中设置 ARTWORK_DIR}:/var/lib/musicbase/media/artwork"
+      # - "${ARTWORK_DIR:?请在 .env 中设置 ARTWORK_DIR}:/var/lib/musicbase/media/artwork"
       - app_data:/var/lib/musicbase/logs
     # 固定 IP：见文件末尾 networks.musicbase 的说明（避免 api 重启换 IP 后 nginx 502）
     networks:
