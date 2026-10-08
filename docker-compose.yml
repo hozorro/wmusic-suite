@@ -232,14 +232,28 @@ services:
       args:
         NODE_VERSION: "22"
         NGINX_VERSION: "1.27"
-        # 路由基座，必须与 nginx conf.d/music.conf 中的 location 一致
+        # 路由基座，必须与 nginx conf.d/music.conf 中的 location 一致：
+        #   /        -> root  /usr/share/nginx/html/player
+        #   /admin/  -> alias /usr/share/nginx/html/man/
         PLAYER_BASE: "/"
         MAN_BASE: "/admin/"
-        # 透传给前端的运行时配置
-        VITE_API_BASE: "/api"
-        VITE_MEDIA_BASE: "/media"
-        VITE_ARTWORK_BASE: "/artwork"
-        VITE_ENABLE_PWA: "${VITE_ENABLE_PWA:-true}"
+        # ------------------------------------------------------------------
+        # 前端的 VITE_* 构建期变量【不在这里配】，全部固定在
+        # docker/web/Dockerfile 里。原因有两条：
+        #
+        # 1) 它们是"两个应用各自的身份常量"，不是部署参数：
+        #      musicplayer -> VITE_CLIENT_TYPE=player / VITE_TOKEN_PREFIX=player_
+        #      musicman    -> VITE_CLIENT_TYPE=admin  / VITE_TOKEN_PREFIX=admin_
+        #                     VITE_BASE_URL=/api/
+        #    同一个 build arg 没法给两个 stage 传不同的值；放进来就得拆成 8 个
+        #    带前缀的变量。更糟的是它制造了第二份副本——一旦有人手滑把两边都
+        #    填成 admin_，两端 token 前缀撞车会互相顶号，而构建期毫无报错。
+        #
+        # 2) 前端仓库的 .env* 被 .dockerignore 的 `**/.env.*` 挡在构建上下文之外，
+        #    镜像里的取值本来就只由 Dockerfile 决定，放 compose 里也是纯冗余。
+        #
+        # 要改就改 docker/web/Dockerfile 顶部那两个 ARG 段（有详细说明）。
+        # ------------------------------------------------------------------
     image: musicbase/web:${IMAGE_TAG:-latest}
     container_name: musicbase-web
     restart: unless-stopped

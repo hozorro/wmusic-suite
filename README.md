@@ -306,6 +306,7 @@ nginx 侧 `/media/` 标了 `internal`，外部直连一律 404；配合一次性
 *"If not explicitly set by script together with X-Accel-Redirect, Content-Type will be set by  
 nginx according to extension of the redirect destination and types/default_type defined"*）：
 
+
 | 后端有没有返回 `Content-Type` | nginx 的行为                                                  |
 | ---------------------- | ---------------------------------------------------------- |
 | **没返回**（推荐）            | 按重定向目标的**扩展名**查 `types` 表；查不到就用该 location 的 `default_type` |
@@ -325,7 +326,6 @@ audio/midi mid midi kar;  audio/mpeg mp3;  audio/ogg ogg;  audio/x-m4a m4a;  aud
 于是 `.flac` 查表失败 → 落到 `default_type application/octet-stream`；再叠加本配置里的  
 `X-Content-Type-Options: nosniff`（浏览器失去了嗅探兜底）→ `<audio>` 直接  
 *"Failed to load because no supported source was found"*。mp3 没事、flac 全挂，非常难查。
-
 
 **修复方案**（本仓库已内置）：`docker/nginx/mime.types.audio` 补齐全部音频后缀，在 `nginx.conf`  
 的 http 层 include——nginx 的 `types` 块允许多次出现且**有累加语义**（同名扩展后者覆盖前者），  
@@ -559,6 +559,7 @@ inotify 在上面后两种场景里**不报错、只是永远不触发** —— 
 > 查看/调整：`sysctl fs.inotify.max_user_watches`（默认 8192～65536），  
 > 在宿主机改 `/etc/sysctl.conf` 后 `sysctl -p`。
 
+
 ⚠️ **但 `WATCH_MODE` 目前仍是"配了不生效"**：`watcher.py` 里写死了
 
 ```python
@@ -645,7 +646,6 @@ app/utils/aidmatch.py  →  pyacoustid (acoustid.py)  →  执行 fpcalc 可执�
                                                         ↑ acoustid.py:
                                                           fpcalc = os.environ.get('FPCALC', 'fpcalc')
 ```
-
 
 所以镜像里必须有 `fpcalc`。**本栈已内置**（`docker/backend/Dockerfile` 的 fpcalc stage），  
 后端代码一个字都不用改。
@@ -837,6 +837,7 @@ env_file:
 | `WATCH_MODE`                       | 只对 `watcher` 服务有意义，且**需先给 `watcher.py` 打补丁**才生效（§4.5）                                                                         |
 | 值里的 `$`                            | compose 会对 `env_file` 的未加引号/双引号值做插值，密码里的 `$` 必须写成 `$$`；Compose ≥ 2.30 可改用 `env_file: [{path: .env, format: raw}]` 彻底跳过插值      |
 
+
 ### 5.5 可选增强（不改也完全能跑）
 
 如果将来想把密钥换成 docker secret / 挂载文件，把一行改成可覆盖即可：
@@ -948,7 +949,6 @@ volumes:
 | compose 用到的路径是否在 `volumes` 里有挂载点 | 路径指向不存在的目录                                                 |
 | 死变量检测                            | compose 里配了，但后端 `config.py`、`entrypoint`、`Dockerfile` 都没消费 |
 
-
 判据的演进过程值得记下：最初用「entrypoint 有没有提到」→ 漏判（脚本自己设、自己读等于空转）；  
 再改成「`.env.example` 里有没有」→ 也漏判（它是文档，不是契约）。  
 **现在的判据是"后端 `app/core/config.py` 里有没有这个字段或 property"**，  
@@ -1032,22 +1032,124 @@ uv lock
 
 ---
 
-## 7. 前端需要配合的改动清单
+## 7. 前端构建期变量：镜像里只有一个来源
 
-| 项目          | 改动                                                                                                                       |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------ |
-| musicplayer | `vite build --base=/`（构建参数 `PLAYER_BASE`，已注入）；所有 `fetch` 走 `import.meta.env.VITE_API_BASE`；音频地址用后端返回的 X-Accel URL 而非直拼路径 |
-| musicman    | `vite build --base=/admin/`（构建参数 `MAN_BASE`，已注入）；router 用 `createWebHistory('/admin/')`                                  |
-| 两者          | 提供 `package-lock.json`（或改 Dockerfile 里的锁文件分支）                                                                            |
+### 7.1 先明确一件事：前端仓库的 `.env*` 对容器构建不起作用
 
-想更彻底地"一处配置"，可以在 `vite.config.ts` 里写：
+根目录 `.dockerignore` 有 `**/.env.*`，`.env`、`.env.development`、`.env.production`、  
+`.env.production.local` **全都进不了构建上下文**。所以镜像里的取值 100% 由  
+`docker/web/Dockerfile` 决定，没有第二个来源。
+
+顺带确认了优先级（Vite 6.3.5 实测）：`loadEnv()` 先读 `.env` 文件，**最后**遍历  
+`process.env` 覆盖同名键 —— 所以 Dockerfile 的 `ENV` 一定赢过仓库里的  
+`.env.production`。不会出现"两份值打架、谁生效看运气"的情况。
+
+这也解释了一个容易踩的坑：本地 `yarn build` 是对的、容器里是错的。构造这类差异  
+最省事的验证办法是 `vite build --mode <一个不存在的模式>`，Vite 就找不到任何  
+`.env` 文件，等价于"构建上下文里没有 env 文件"。
+
+### 7.2 两个前端实际读的变量（对源码 grep `import.meta.env` 的结论）
+
+| 变量                  | musicplayer  | musicman       | 备注                              |
+| ------------------- | ------------ | -------------- | ------------------------------- |
+| `VITE_CLIENT_TYPE`  | 需要 `player`  | 需要 `admin`     | 源码里有 `\|\|` 兜底，但兜底值恰好相同是巧合，不该依赖 |
+| `VITE_TOKEN_PREFIX` | 需要 `player_` | 需要 `admin_`    | 同上；两边撞车会导致两个应用互相顶号              |
+| `VITE_BASE_URL`     | 未使用          | **必须 `/api/`** | 唯一**没有兜底**的变量，缺了直接出故障           |
+
+`VITE_BASE_URL` 的坑值得单独记住。代码里是这么用的：
 
 ```ts
-export default defineConfig(({ mode }) => ({
-  base: process.env.VITE_BASE ?? '/',
-  server: { proxy: { '/api': { target: 'http://localhost:8000', changeOrigin: true } } },
-}))
+// wmusicman/src/apis/methods/manage.ts:5（layout/Main.vue、views 下 4 个组件同款，共 6 处）
+const baseURL = import.meta.env.VITE_BASE_URL
+url = baseURL + `artwork/artist/${id}`        // 直接字符串相加，没有任何兜底
 ```
+
+变量缺失时 Vite 把它替换成 `undefined`，产物里留下的是字面量  
+`undefinedartwork/default/...` —— 管理后台所有封面/图片全部 404，而且  
+**不报错、不进控制台**，只是静默裂图。
+
+已实测复现（`--mode` 模拟无 env 环境，仓库根目录实建）：
+
+| 是否注入       | 产物里实际编译出的字节                                           |
+| ---------- | ----------------------------------------------------- |
+| 不注入        | ``const a=`undefinedartwork/default/${o.art_type}` `` |
+| 注入 `/api/` | ``const a="/api/"+`artwork/default/${o.art_type}` ``  |
+
+两个取值要点：
+
+- **必须带结尾斜杠**。它是拿去直接拼字符串的，不是喂给 `new URL()` 的。
+- **必须用相对路径 `/api/`**，走 nginx 同源代理。不要填  
+  `wmusicman/.env.development.local` 里的 `http://192.168.137.247/api/` ——  
+  那是 dev server 用的，打进镜像会变成硬编码内网 IP + 跨域请求。
+
+
+### 7.3 以下变量**不需要**配（两个前端源码里都是 0 引用）
+
+| 变量                  | 为什么不需要                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `VITE_API_BASE`     | 只被两个 `vite.config.ts` 的 dev server proxy 读取。生产环境的 API 基址在 `src/apis/index.ts` 里**硬编码为 `/api/` 了**（`createAlova({ baseURL: '/api/' })`），由 nginx 同源转发，构建期给不给值都一样 |
+| `VITE_MEDIA_BASE`   | 播放器的封面/音频路径在 `src/services/transform.ts` 里硬编码 `/media/...`                                                          |
+| `VITE_ARTWORK_BASE` | 同上，0 引用                                                                                                            |
+| `VITE_ENABLE_PWA`   | PWA 由 `vite.config.ts` 的 `VitePWA` 插件**无条件**启用，不注入也照常产出 `sw.js` / `manifest.webmanifest`（已实测）                        |
+| `VITE_APP_NAME`     | 0 引用；PWA manifest 里的名字在 `vite.config.ts` 里写死为 `'WMusicPlayer'`                                                     |
+
+### 7.4 锁文件：必须显式 COPY，不能用通配符
+
+两个前端都是 **yarn v1** 工程（只有 `yarn.lock`，没有 `package-lock.json`；
+`package.json` 里也没有 `packageManager` 字段；`yarn.lock` 头部是
+`# yarn lockfile v1`）。原 Dockerfile 写的是：
+
+```dockerfile
+COPY musicplayer/package-lock.json* ./
+```
+
+这一行在本仓库**必定让构建失败**，因为 Docker 的 `COPY` 通配符一旦匹配不到任何
+文件，是直接以
+
+```
+COPY failed: no source files were specified
+```
+
+中断构建，**不是静默跳过**（这点和 shell 的 glob 行为不同，很容易想当然）。
+已改成显式列出：
+
+```dockerfile
+COPY musicplayer/package.json musicplayer/yarn.lock ./
+```
+
+yarn 版本也显式钉住 `ARG YARN_VERSION=1.22.22`，不依赖 corepack 的内置默认值。
+corepack 0.34.6 对 yarn 的 `default` 恰好是 1.22.22（与 v1 lockfile 匹配），
+但这个值会随 corepack 版本变 —— 基础镜像换 node 版本时可能悄悄变成 yarn 4，
+而 yarn 4 读 v1 lockfile 再带 `--frozen-lockfile` 会直接报错。
+
+`scripts/check.sh` 会核对 Dockerfile 里 COPY 的锁文件名与实际存在的是否一致，
+所以将来换包管理器时不会漏改。
+
+### 7.5 路由基座
+
+| 项目          | base        | 来源                                                                                                     |
+| ----------- | ----------- | ------------------------------------------------------------------------------------------------------ |
+| musicplayer | `/`         | `vite.config.ts` 里硬编码 `base: '/'`；构建参数 `PLAYER_BASE` 通过 `--base=` 覆盖（值相同，属于显式声明，不是必需）                     |
+| musicman    | `/admin/`   | 同上，硬编码 `base: '/admin/'`；对应 nginx 的 `alias /usr/share/nginx/html/man/`                                  |
+| musicman    | router 基座   | `router/index.ts:42` 的 `createWebHistory('/admin/')`，必须与 base 一致，否则刷新页面 404                                |
+| musicplayer | router 基座   | `router/index.ts:85` 的 `createWebHistory()`，与 base `/` 一致                                               |
+
+`PLAYER_BASE` / `MAN_BASE` 必须与 `docker/nginx/conf.d/music.conf` 里的 location
+保持一致 —— 改一处就要改另一处。
+
+### 7.6 已知的上游小问题（不影响构建）
+
+`wmusicman/src/store/auth.ts:17` 写的是 `import.meta.env.VITE_APP_TYPE`，
+而 `wmusicplayer` 同一行写的是 `VITE_CLIENT_TYPE`。`VITE_APP_TYPE` 在两个仓库里
+都没有任何定义处，所以 `appType` 恒为 `undefined`（好在目前没有消费方）。
+
+这是上游的拼写问题，**不要靠注入一个叫 `VITE_APP_TYPE` 的变量去迎合它** ——
+那只会把 bug 掩盖住。`scripts/check.sh` 会把它作为 `!` 提示列出来，不阻塞构建。
+上游改正后检查自动转绿。
+
+> 另注：`wmusicman/src/apis/methods/manage.ts:4` 有一行被注释掉的
+> `import.meta.env.VITE_BASE_SRC_URL`。它是死代码，别把它当成需要配置的变量
+> （`check.sh` 的源码核对会先剔掉注释行，不会误报）。
 
 ---
 
