@@ -51,9 +51,19 @@ fi
 if [ -f "${SNAP}/media.tar.gz" ] && [ -d "${MEDIA_DIR:-}" ]; then
     echo "==> 恢复媒体目录（artwork / uploads / playlists）"
     tar -xzf "${SNAP}/media.tar.gz" -C "${MEDIA_DIR}"
-elif [ -f "${SNAP}/artwork.tar.gz" ] && [ -d "${ARTWORK_DIR:-}" ]; then
-    echo "==> 恢复 artwork 缓存（旧版备份格式）"
-    tar -xzf "${SNAP}/artwork.tar.gz" -C "${ARTWORK_DIR}"
+elif [ -f "${SNAP}/artwork.tar.gz" ]; then
+    # 旧版备份格式：那时 artwork 还被当成独立目录（ARTWORK_DIR）。
+    # 现在它恒等于 MEDIA_DIR/artwork，所以没设 ARTWORK_DIR 时落到那个位置。
+    art_dst="${ARTWORK_DIR:-}"
+    if [ -z "${art_dst}" ] && [ -n "${MEDIA_DIR:-}" ]; then
+        art_dst="${MEDIA_DIR}/artwork"
+    fi
+    if [ -d "${art_dst}" ]; then
+        echo "==> 恢复 artwork 缓存（旧版备份格式）: ${art_dst}"
+        tar -xzf "${SNAP}/artwork.tar.gz" -C "${art_dst}"
+    else
+        echo "==> 备份里没有媒体文件，跳过"
+    fi
 else
     echo "==> 备份里没有媒体文件，跳过"
 fi

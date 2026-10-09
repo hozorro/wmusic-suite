@@ -1,18 +1,29 @@
 # ---------------------------------------------------------------------------
 # 音频/歌词类型补充。
-# nginx 官方 conf/mime.types 的音频部分只有 5 条：
-#     audio/midi mid midi kar; audio/mpeg mp3; audio/ogg ogg;
-#     audio/x-m4a m4a; audio/x-realaudio ra;
+#
+# ⚠️ 本表【只写官方 /etc/nginx/mime.types 里没有的扩展名】。官方已有的再写一遍，
+#    得到的是 nginx 每次启动都刷的一位警告，而不是"更明确的声明"：
+#        [warn] duplicate extension "m4a", content type: "audio/x-m4a",
+#               previous content type: "audio/x-m4a" in /etc/nginx/mime.types.audio:26
+#    源码里重复的那条确实会覆盖前一条（ngx_http_core_module.c：
+#    `type[n].value = content_type;`），但【只打一条 warn 就继续跑】—— 于是
+#    "我改的类型到底生效没有"变得只能靠猜。本套件在构建期直接把它拦下（见
+#    docker/web/Dockerfile Stage 3 的静态自检），scripts/check.sh 也有一份。
+#
+# nginx 官方表的音频部分（nginx:1.27-alpine，共 5 行，已逐字核对）：
+#     audio/midi mid midi kar;   audio/mpeg mp3;          audio/ogg ogg;
+#     audio/x-m4a m4a;           audio/x-realaudio ra;
+# 另有（在 application/ 段里，容易看漏）：
+#     application/vnd.apple.mpegurl m3u8;
 # 缺 flac / wav / opus / aac / ape / dsf 等 —— 缺失后缀会落到 default_type，
 # 再叠加 X-Content-Type-Options: nosniff，浏览器会直接拒绝播放。
 #
-# http 层允许多个 types 块并存且有累加语义，同名扩展后出现的覆盖先出现的。
-# 所以这里只需 include 在官方 mime.types 之后即可。
+# http 层允许多个 types 块并存且有累加语义，所以这里只需 include 在官方表之后即可。
 # ---------------------------------------------------------------------------
 types {
     # 无损：本项目主要的两类文件之一
     # 用 IANA 标准名 audio/flac，不要写旧的 audio/x-flac
-    # （同名扩展后出现的会覆盖前面的，所以这里只允许一条 flac 记录）
+    # （同名扩展后写的会覆盖先写的，所以这里只允许一条 flac 记录）
     audio/flac                                       flac;
 
     # PCM / 未压缩
@@ -21,9 +32,9 @@ types {
     audio/x-aiff                                     aif aifc aiff;
 
     # 有损 & 流媒体常见封装
+    # 官方表已有 .m4a，不要再写（写了就是 duplicate extension）
     audio/aac                                        aac;
     audio/mp4                                        m4b;
-    audio/x-m4a                                      m4a;
     audio/opus                                       opus;
     audio/ogg                                        oga spx;
     audio/mpeg                                       mp2 mpga mp1;
@@ -38,8 +49,12 @@ types {
     audio/x-ms-wma                                   wma;
 
     # 播放列表 / 歌词 / 音轨索引
+    # .m3u8 官方表已经映射成 application/vnd.apple.mpegurl（IANA 注册的 HLS
+    # 播放列表类型），本表原来把它改写成 audio/mpegurl —— 改回官方值：为一条
+    # 这库里几乎不会出现的后缀背一个启动警告不值得。.m3u 官方表没有，照补。
     audio/x-scpls                                    pls;
-    audio/mpegurl                                    m3u m3u8;
+    audio/mpegurl                                    m3u;
     audio/x-cue                                      cue;
 }
+
 

@@ -119,10 +119,25 @@ services:
       # 必须绝对路径 + 落在持久化卷，否则容器重建后网易云登录态丢失
       NETEASE_COOKIES_FILE: /var/lib/musicbase/media/netease_cookies.json
       # ---- (a2) 与 nginx 强耦合：X-Accel-Redirect 的内部前缀 ----
-      # stream.py 里 inner = MUSIC_STATIC_PREFIX + quote(track.path)，
-      # 必须与 music.conf 的 `location ^~ /music/`（alias /music/）**完全一致**
-      # 含结尾斜杠，否则 nginx 找不到 location，播放 404。
-      # 后端默认值是 /music（对应它原生部署的 nginx），容器里必须改。
+      # stream.py:99 里 inner = MUSIC_STATIC_PREFIX + urllib.parse.quote(track_path)，
+      # 而 track_path 是【相对音乐库】的路径（扫描时写入 rel_path，不带前导斜杠），
+      # 例如 'Artist/Album/a.flac'。
+      #
+      # ⚠️ 两个坑，缺一个就是"能登录、能浏览、一按播放就无声"：
+      #   1) 值【必须】与 music.conf 里的 `location ^~ /music/`（alias /music/）
+      #      完全一致 —— nginx 找不到 location 会把请求交给 `location /`，
+      #      而那里 try_files 兜底到 /index.html，于是浏览器收到的是
+      #      200 + 一坨 HTML，播放器报解码错误而不是 404，最难查。
+      #   2) 值【必须带结尾斜杠】。后端是纯字符串相加，没有补斜杠的逻辑：
+      #         '/music/' + 'Artist/a.flac'  ->  /music/Artist/a.flac   ✓
+      #         '/music'  + 'Artist/a.flac'  ->  /musicArtist/a.flac    ✗
+      #      而后端的默认值恰恰是 '/music'（config.py:76），所以这一行
+      #      不能删、必须显式写，等于把上游默认值的坑在这里堵掉。
+      #
+      # ⚠️ 不能写成 /media/ ：那是【封面】的公开静态路径（见 music.conf 的
+      #    `location ^~ /media/`，对应后端 main.py 里 DEBUG 模式挂载的
+      #    /media/artists|albums|tracks|playlists）。音频与封面共用同一前缀，
+      #    一个 location 就没法 alias 到两个不同的根目录。
       MUSIC_STATIC_PREFIX: /music/
       # ---- (a3) 服务发现与监听 ----
       HOST: "0.0.0.0"                           # 容器内监听所有网卡（对外端口由 web 的 ports 决定）
@@ -153,9 +168,9 @@ services:
       #    跨设备时它会静默降级成「复制后删除」：大文件慢，中断还会留半个文件。
       #    make check 会用 stat 设备号比对两者，不等就报错。
       - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/var/lib/musicbase/media"
-      # artwork 单独映射时，这一行会覆盖 MEDIA_ROOT/artwork 子目录。
-      # 不需要独立目录（用 MEDIA_DIR/artwork 即可）时删掉本行。
-      # - "${ARTWORK_DIR:?请在 .env 中设置 ARTWORK_DIR}:/var/lib/musicbase/media/artwork"
+      # ⚠️ 刻意【不再】单独挂 ARTWORK_DIR：artwork 就落在 MEDIA_ROOT/artwork
+      #    （= MEDIA_DIR/artwork），上面那行已经完整覆盖它。多挂一层等于把同一个
+      #    子目录映射两次，还会让「artwork 到底在哪」多出第二个答案。
       - app_data:/var/lib/musicbase/logs
     # 固定 IP：见文件末尾 networks.musicbase 的说明（避免 api 重启换 IP 后 nginx 502）
     networks:
@@ -229,6 +244,21 @@ services:
     build:
       context: .
       dockerfile: docker/web/Dockerfile
+      # ------------------------------------------------------------------
+      # 这里【不再需要】build.extra_hosts。
+      #
+      # 曾经加过 `extra_hosts: ["api=127.0.0.1"]`，是为了让 Dockerfile 末尾那句
+      # `nginx -t` 能解析 upstream 里的 api：nginx 在【解析配置】阶段就解析 upstream
+      # 主机名，而构建容器不在 musicbase-net 里，于是每次 build 都以
+      #     nginx: [emerg] host not found in upstream "api:8000" ... exit code: 1
+      # 结束。实测这条 extra_hosts 并没有真正落到构建容器的 /etc/hosts 上（构建照样
+      # 失败），所以换了个更彻底的做法：构建期【不跑】会碰 upstream 的 nginx -t，
+      # 只跑一个"仅含类型表"的最小配置做自检（不需要 DNS）。详见
+      # docker/web/Dockerfile Stage 3。配置语法交给 nginx 自己在容器启动时校验。
+      #
+      # 留着的代价：一个看起来像有兜底、实际没生效的键，会让人误判"护栏已经在了"。
+      # scripts/check.sh 会拦住它再次出现。
+      # ------------------------------------------------------------------
       args:
         NODE_VERSION: "22"
         NGINX_VERSION: "1.27"
@@ -263,10 +293,15 @@ services:
     ports:
       - "${HTTP_PORT:-8080}:80"
     volumes:
-      # nginx 只读挂载：音频/封面只做下载分发，写操作一律走 API
-      # 路径必须与 music.conf 里的 alias 一致（/media/ -> /music/，/artwork/ -> ...）
+      # nginx 只读挂载：音频/封面只做下载分发，写操作一律走 API。
+      # 两个挂载点必须与 music.conf 里的 alias 一一对上：
+      #   /music/  -> alias /music/                              （音频，internal + X-Accel）
+      #   /media/  -> alias /var/lib/musicbase/media/artwork/    （封面，公开静态）
       - "${MUSIC_DIR:?请在 .env 中设置 MUSIC_DIR}:/music:ro"
-      - "${ARTWORK_DIR:?请在 .env 中设置 ARTWORK_DIR}:/var/lib/musicbase/media/artwork:ro"
+      # 封面：不再有独立的 ARTWORK_DIR —— artwork 就是 MEDIA_DIR/artwork，
+      # 所以把整根媒体目录只读挂进来即可（nginx 的 /media/ alias 只暴露其中的
+      # artwork/ 子目录，uploads/ 与 netease_cookies.json 不会被 HTTP 触达）。
+      - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/var/lib/musicbase/media:ro"
     networks:
       - musicbase
     logging: *default-logging

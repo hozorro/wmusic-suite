@@ -33,7 +33,7 @@ docker compose exec -T db pg_dump \
     "${POSTGRES_DB:-musicbase}" > "${OUT}/musicbase.sql"
 
 # 媒体根目录：artwork 缓存 + uploads/temp + uploads/staging（可能还有没归档的上传）
-# 只备份 MEDIA_DIR 就够了，ARTWORK_DIR 是它下面被单独挂载的子目录。
+# artwork 就在 MEDIA_DIR/artwork 下面（没有独立的 ARTWORK_DIR 了），所以打这一份就够。
 if [ -d "${MEDIA_DIR:-}" ]; then
     echo "==> 打包媒体目录（artwork / uploads / playlists）: ${MEDIA_DIR}"
     tar -czf "${OUT}/media.tar.gz" -C "${MEDIA_DIR}" .
@@ -59,7 +59,6 @@ cat > "${OUT}/meta.json" <<EOF
   "image_tag": "${IMAGE_TAG:-latest}",
   "music_dir": "${MUSIC_DIR:-}",
   "media_dir": "${MEDIA_DIR:-}",
-  "artwork_dir": "${ARTWORK_DIR:-}",
   "files": $(ls -1 "${OUT}" | sed 's/.*/"&"/' | paste -sd, -)
 }
 EOF
