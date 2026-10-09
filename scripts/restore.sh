@@ -68,9 +68,6 @@ else
     echo "==> 备份里没有媒体文件，跳过"
 fi
 
-# 刻意【不】自动覆盖 musicbase/.env：
-# 那里的 SECRET_KEY 一旦变回旧值，当前所有已签发的 JWT 会立刻失效（用户全部被登出），
-# 而这是不是你想要的结果，脚本无从判断。所以只提示，由人决定。
 if [ -f "${SNAP}/musicbase.env.bak" ]; then
     echo "==> 备份里含 musicbase/.env（后端密钥）。若确需一并回滚，请手动执行："
     echo "     cp '${SNAP}/musicbase.env.bak' musicbase/.env"

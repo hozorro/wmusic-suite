@@ -9,16 +9,11 @@
 # ---------------------------------------------------------------------------
 set -Eeuo pipefail
 
-# 新建文件的默认权限（归档入库、标签改写生成的临时文件都受它影响）。
-# 022 -> 644/755；002 -> 664/775（同组可写，适合音乐库按组共享的场景）
 umask "${UMASK:-022}"
 
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
 RUN_USER="${RUN_USER:-musicbase}"
-# ⚠️ 只认后端 config.py 里真实存在的字段。TEMP_DIR / STAGING_DIR / ARTWORK_DIR
-#    在那边是只读 property（由 MEDIA_ROOT 派生），用环境变量设它们是无效的，
-#    所以这里也不能拿这些名字去 mkdir/chown —— 那样只会建出一堆没人用的空目录。
 MEDIA_ROOT="${MEDIA_ROOT:-/var/lib/musicbase/media}"
 LOG_DIR="${LOG_DIR:-/var/lib/musicbase/logs}"
 
@@ -37,9 +32,6 @@ fi
 uid_for() { id -u "$1" 2>/dev/null || echo 0; }
 
 # ---------- 2. 目录 ----------
-# 后端启动时会自己 create_required_directories()，但那时已经降权成 PUID 了；
-# 若宿主目录属主是 root，它会因权限不足而失败。所以在降权之前先把目录建好、属主对齐。
-# 目录清单必须与 config.py 的 property 一致，多建少建都会导致运行时找不到路径。
 MEDIA_SUBDIRS=(
     "artwork/tracks" "artwork/albums" "artwork/artists" "artwork/playlists" "artwork/tmps"
     "uploads/temp" "uploads/staging"
@@ -51,15 +43,9 @@ for sub in "${MEDIA_SUBDIRS[@]}"; do
 done
 
 if [ "$(id -u)" = "0" ]; then
-    # MEDIA_ROOT / LOG_DIR 是应用自己的数据目录，属主必须归 PUID，否则标签改写、
-    # 归档入库、日志写入都会 Permission denied。
-    # 注意 ARTWORK_DIR 可能是独立挂载进来的宿主机目录，chown 会作用到宿主上——
-    # 这是预期行为（它就是给本应用用的缓存目录）。
     chown -R "${PUID}:${PGID}" "${MEDIA_ROOT}" "${LOG_DIR}" 2>/dev/null || true
 fi
 
-# 音乐库是用户的目录，默认【不】碰它的属主。
-# 若宿主机音乐库确实不可写，可打开开关由容器一次性修正（大库会很慢，谨慎！）
 if [ "${CHOWN_LIBRARY:-false}" = "true" ] && [ "$(id -u)" = "0" ]; then
     log "CHOWN_LIBRARY=true，正在递归修正音乐库属主（大库会很慢）..."
     chown -R "${PUID}:${PGID}" "${MUSIC_LIBRARY_PATH:-/music}" 2>/dev/null || true
@@ -67,9 +53,6 @@ fi
 
 # ---------- 3. 等数据库 ----------
 if [ "${WAIT_FOR_DB:-true}" = "true" ]; then
-    # 两种配置风格都支持：
-    #   DATABASE_URL=postgresql+psycopg://... （compose 注入）
-    #   或后端 Settings 真正在用的 DB_HOST / DB_PORT
     log "等待数据库就绪 ..."
     python - <<'PY'
 import os, socket, sys, time
@@ -112,14 +95,6 @@ if [ "${RUN_MIGRATIONS:-true}" = "true" ]; then
 fi
 
 # ---------- 5. 启动 ----------
-# UVICORN_WORKERS 来自 .env（部署层）。默认 1：本项目涉及标签改写、文件整理、
-# 归档入库等会写同一个文件的操作，多 worker 会出现两个进程并发写同一首歌。
-# 只有确认长任务都走独立任务队列后，才建议调大。
-#
-# ⚠️ 只对 uvicorn 生效。本镜像还被 watcher 服务复用，它的 CMD 是
-#    `python -m app.background.watcher`；给那个进程追加 --workers 毫无意义
-#    （该模块没有 argparse，参数会被静默丢掉），但启动日志会显示一个并不存在
-#    的 worker 数，排查时误导人。
 RUNS_UVICORN=0
 case " $* " in *uvicorn*) RUNS_UVICORN=1 ;; esac
 

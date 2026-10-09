@@ -10,9 +10,6 @@ fail=0
 err()  { echo "  ✗ $*"; fail=1; }
 ok()   { echo "  ✓ $*"; }
 
-# 取 compose 里某个服务的整段（`  <svc>:` 到下一个服务或文件末尾）
-# 顶格行（`services:` / `networks:` / `volumes:` 等顶层键）视为服务段结束 ——
-# 最后一个服务段后面就是顶层键，不这样切会把 networks/volumes 段也算进去。
 svc_block() {
     awk -v want="$1" '
         /^[^[:space:]#]/ { inblk = 0 }
@@ -24,8 +21,6 @@ svc_block() {
     ' docker-compose.yml
 }
 
-# 取某个服务 volumes: 段下的挂载行（已剥注释与引号）
-# 必须限定在 volumes 段内，否则 ports: 里的 "8080:80" 会被当成挂载行。
 svc_volumes() {
     svc_block "$1" | awk '
         /^    [a-zA-Z_]/ { invol = 0 }
@@ -44,6 +39,44 @@ echo "== 构建上下文必需文件"
 [ -f docker/backend/Dockerfile ] && ok "docker/backend/Dockerfile" || err "缺少后端 Dockerfile"
 [ -f docker/web/Dockerfile ]     && ok "docker/web/Dockerfile"     || err "缺少前端 Dockerfile"
 
+echo "== 行尾符（CRLF 会让容器里的 entrypoint 起不来，而 git 看不见）"
+# .gitattributes 必须把行尾钉死：Windows 上 Git 常默认 core.autocrlf=true，
+# 工作区会被写成 CRLF，但 git diff/status 会自动归一化，完全看不出差别。
+if [ -f .gitattributes ] && grep -qE '^[[:space:]]*\*[[:space:]]+text=auto[[:space:]]+eol=lf' .gitattributes; then
+    ok ".gitattributes 把全局行尾钉成 LF"
+else
+    err "缺少 .gitattributes（或里面没有 '* text=auto eol=lf'）：工作区可能被写成 CRLF 而 git 报告不了"
+    echo "     修复：printf '* text=auto eol=lf\n' > .gitattributes"
+fi
+
+# 逐文件查工作区行尾。只查会被 COPY 进镜像或在 Linux 上执行的那几类。
+#
+# ⚠️ 这里只能用「数 CR 字节」这一种办法。踩过的坑：
+#    * `grep $'\r'` / `awk '/\r$/'` / `sed` 在 MSYS(Git Bash) 上按文本模式读文件，
+#      CR 会被吃掉 —— 拿真 CRLF 文件实测，它们一律返回"干净"（静默假阴性，
+#      我第一版就是这么写成空断言的）。
+#    * `git ls-files --eol` 在索引 stat 信息过期的工作副本里会整片误报 w/crlf。
+#    tr / od / wc 直接处理字节，实测既不会漏也不会被文件里的字面 "\\r" 骗到。
+crlf_hits=""
+for f in scripts/*.sh docker/backend/*.sh docker/backend/Dockerfile docker/web/Dockerfile \
+         docker/nginx/nginx.conf docker/nginx/mime.types.audio docker/nginx/conf.d/*.conf \
+         docker-compose.yml docker-compose.dev.yml Makefile .dockerignore .env.example; do
+    [ -f "$f" ] || continue
+    n="$(LC_ALL=C tr -dc '\r' < "$f" 2>/dev/null | LC_ALL=C wc -c)"
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+        crlf_hits="${crlf_hits}      - ${f}（${n// /} 个 CR）"$'\n'
+    fi
+done
+if [ -z "${crlf_hits}" ]; then
+    ok "构建相关文件的工作区行尾都是 LF"
+else
+    err "以下文件带 CRLF，会被原样 COPY 进镜像："
+    printf '%s' "${crlf_hits}"
+    echo "     最典型的后果：docker/backend/entrypoint.sh 的 shebang 变成 '#!/usr/bin/env bash\\r'，"
+    echo "     内核去找名叫 'bash\\r' 的解释器，容器启动直接失败（no such file / exec format error）。"
+    echo "     修复：git rm --cached -r . && git reset --hard   # 按 .gitattributes 重写工作区"
+fi
+
 echo "== 后端依赖清单"
 if [ -f musicbase/pyproject.toml ]; then
     ok "musicbase/pyproject.toml"
@@ -60,13 +93,6 @@ else
 fi
 
 echo "== 前端依赖清单与锁文件 COPY"
-# COPY 的锁文件名必须与实际存在的锁文件一致。两个方向都会出事：
-#   * 名字对不上     -> 镜像里没有锁文件，安装退化成 npm install，依赖版本不可复现；
-#   * 用通配符且没匹配到 -> Docker 直接以
-#                          COPY failed: no source files were specified
-#                        中断构建（不是静默跳过）。
-# 这条断言就是这两个坑的守卫：上游换了包管理器（比如从 yarn 换到 pnpm），
-# 这里会立刻报出来，而不是等到 docker build 失败或线上依赖漂移。
 df_copy="$(sed 's/#.*//' docker/web/Dockerfile 2>/dev/null | grep -E '^[[:space:]]*COPY' || true)"
 for p in musicplayer musicman; do
     if [ -f "$p/package.json" ]; then ok "$p/package.json"; else err "缺少 $p/package.json"; continue; fi
@@ -92,13 +118,6 @@ for p in musicplayer musicman; do
 done
 
 echo "== 前端依赖安装方式（yarn 要只用基础镜像自带的那份）"
-# node:*-alpine 自带 yarn：官方 Dockerfile 把它解到 /opt，再在 /usr/local/bin 建两个
-# 符号链接（yarn / yarnpkg）。此时若再 `npm i -g yarn@x`，npm 也往同一路径写符号链接，
-# 撞上就是构建中断（实测 node:22-alpine）：
-#     npm error code EEXIST
-#     npm error path /usr/local/bin/yarn
-#     npm error EEXIST: file already exists
-# 正确做法：先 command -v yarn 探测，缺了才装；并断言主版本是 1.x（v1 lockfile 要求）。
 if [ ! -f docker/web/Dockerfile ]; then
     err "缺少 docker/web/Dockerfile"
 else
@@ -125,13 +144,9 @@ else
 fi
 
 echo "== 前端构建期变量（web Dockerfile）"
-# 大前提：两个前端仓库的 .env* 被 .dockerignore 的 `**/.env.*` 挡在构建上下文之外，
-# 所以镜像里的 VITE_ 取值【只有一个来源】—— docker/web/Dockerfile。
-# 一旦这里配错，本地 npm run build 是对的、容器里是错的，属于最难查的一类问题。
 if [ ! -f docker/web/Dockerfile ]; then
     err "缺少 docker/web/Dockerfile"
 else
-    # 先剥注释再匹配：Dockerfile 的说明注释里会大段提到这些变量名，不剥必然误报。
     web_df="$(sed 's/#.*//' docker/web/Dockerfile)"
 
     # --- A) 不该注入的：在两个前端源码里 grep 结果都是 0 ---
@@ -189,20 +204,12 @@ else
 
     # --- E) 源码级交叉核对：上游加了新变量、或变量名拼错，这里都会炸 ---
     if [ -d musicplayer/src ] && [ -d musicman/src ]; then
-        # 已知的上游缺陷白名单：报 `!` 而不是 `✗`，因为它不影响构建结果，但必须让人看见。
-        #   wmusicman/src/store/auth.ts:17 写的是 VITE_APP_TYPE，
-        #   而 wmusicplayer 同一行写的是 VITE_CLIENT_TYPE。前者在整个仓库里
-        #   没有任何定义处，值恒为 undefined（好在目前没有消费方）。
-        #   上游改正后删掉本行，检查会自动转为通过。
         known_upstream_bugs="VITE_APP_TYPE"
 
         for spec in "musicplayer:VITE_CLIENT_TYPE VITE_TOKEN_PREFIX" \
                     "musicman:VITE_CLIENT_TYPE VITE_TOKEN_PREFIX VITE_BASE_URL"; do
             p="${spec%%:*}"
             allowed="${spec#*:}"
-            # ★ 必须先剔掉注释行：wmusicman/src/apis/methods/manage.ts 里有一行
-            #   被注释掉的 `// const baseSrcURL = import.meta.env.VITE_BASE_SRC_URL;`
-            #   不剔就会把它当成真实引用，报出一个假阳性。
             used="$(grep -rn --include=*.ts --include=*.vue --include=*.js -I \
                         -E "import\.meta\.env\.VITE_|import\.meta\.env\[['\"]VITE_" "$p/src" 2>/dev/null \
                     | grep -vE "^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)" \
@@ -265,21 +272,7 @@ if sed 's/#.*//' docker/nginx/conf.d/*.conf | grep -qE "types[[:space:]]*\{[[:sp
 else
     ok "未发现清空类型表的空 types {} 块"
 fi
-# ---------------------------------------------------------------------------
-# 补充表只能写【官方表没有的】扩展名。
-#
-# 重复定义的后果不是"更明确"，而是：nginx 每次启动刷一条
-#     [warn] duplicate extension "m4a", content type: "audio/x-m4a",
-#            previous content type: "audio/x-m4a" in /etc/nginx/mime.types.audio:26
-# 源码里重复项确实会覆盖前一条（ngx_http_core_module.c: type[n].value = content_type），
-# 但只打一条 warn 就继续跑 —— "我改的类型生效没有"只能靠猜。这条断言就是钉这个。
-#
-# 官方表清单（nginx:1.27-alpine，逐字核对过官方 conf/mime.types）：
-#   audio/midi mid midi kar;   audio/mpeg mp3;   audio/ogg ogg;
-#   audio/x-m4a m4a;           audio/x-realaudio ra;
-#   application/vnd.apple.mpegurl m3u8;
-# 注意 m3u8 在 application/ 段里，很容易看漏 —— 本套件就漏过一次。
-# ---------------------------------------------------------------------------
+
 OFFICIAL_MIME_EXTS="mid midi kar mp3 ogg m4a ra m3u8"
 mime_exts="$(sed 's/#.*//' docker/nginx/mime.types.audio \
     | awk 'NF > 1 { for (i = 2; i <= NF; i++) { x = $i; gsub(/;/, "", x); if (x != "") print x } }')"
@@ -302,19 +295,12 @@ if [ -n "${dup_official}" ]; then
 else
     ok "mime.types.audio 只补官方表缺失的扩展名（无 m4a / m3u8 之类重复）"
 fi
-# 构建期的等价护栏（那条是拿真 nginx 跑一个只含类型表的最小配置，不需要 DNS）
+
 sed 's/#.*//' docker/web/Dockerfile | grep -qE 'nginx[[:space:]]+-t[[:space:]]+-c' \
     && ok "web Dockerfile 用「仅含类型表的最小配置」跑 nginx -t（不依赖 DNS，能抓 duplicate extension）" \
     || err "web Dockerfile 缺少类型表重复扩展名的构建期自检（别等 nginx 每次启动刷警告才发现）"
 
 echo "== nginx 虚拟主机选择（基础镜像的 default.conf 会静默抢走整个站点）"
-# nginx:alpine 自带 /etc/nginx/conf.d/default.conf：listen 80 + server_name localhost
-# + root /usr/share/nginx/html。而 conf.d 是按文件名字典序 include 的，
-# default.conf 排在 music.conf 之前，于是它就是 80 端口的【默认 server】。
-# 用 IP 访问时 Host 匹配不上任何 server_name -> 落到 default.conf -> root 指向
-# 已被清空的 /usr/share/nginx/html -> "/" 报 403、"/healthz" 报 404。
-# 先剥掉注释再匹配：本套件的 Dockerfile/conf 里大量注释在解释这同一件事，
-# 不剥的话断言会匹配到注释文字而变成空转（反向验证时踩到过）。
 sed 's/#.*//' docker/web/Dockerfile | grep -qE 'rm[[:space:]]+-f[[:space:]]+/etc/nginx/conf\.d/default\.conf' \
     && ok "web Dockerfile 已删除基础镜像自带的 conf.d/default.conf" \
     || err "web Dockerfile 未删除 /etc/nginx/conf.d/default.conf：它会是 80 端口的默认 server，用 IP 访问得到 403/404"
@@ -333,13 +319,7 @@ if [ "${n_conf}" -eq 1 ]; then
 else
     echo "  ! conf.d 下有 ${n_conf} 个 .conf：确认只有一个写了 default_server（同一端口重复声明会让 nginx 起不来）"
 fi
-# 构建期【不该】跑裸的 nginx -t —— 它在构建期必然失败，而且不是配置错误：
-# nginx 在解析配置阶段就解析 upstream 里的主机名，而构建容器不在 musicbase-net 里，
-# 于是每次 build 都以 [emerg] host not found in upstream "api:8000" 结束（真实踩过）。
-# 曾用 compose 的 web.build.extra_hosts 试图补一条构建期 hosts，实测没落到构建容器
-# 上，遂放弃。现在的分工：
-#   * 构建期只做不需要 DNS 的静态自检（default.conf 已删 + 类型表无重复扩展名）
-#   * 配置语法交给 nginx 自己在容器启动时校验（报错与 nginx -t 一字不差）
+
 naive_t=0
 sed 's/#.*//' docker/web/Dockerfile | grep -qE 'nginx[[:space:]]+-t[[:space:]]*$' \
     && naive_t=1
@@ -360,8 +340,6 @@ else
 fi
 
 echo "== API 反代前缀（前端 /api -> 后端 /api/v1）"
-# 前端 baseURL='/api/'（两个项目一样），后端路由挂在 main.py 的 include_router(prefix=...)。
-# 两边对不上就是"页面能打开、一操作就 404"，而且日志里只有后端 404，很容易查错方向。
 API_PREFIX=""
 if [ -f musicbase/app/main.py ]; then
     API_PREFIX=$(sed 's/#.*//' musicbase/app/main.py \
@@ -375,7 +353,6 @@ else
     sed 's/#.*//' docker/nginx/conf.d/music.conf | grep -qF "proxy_pass http://musicbase_api${API_PREFIX}/;" \
         && ok "nginx 把 /api/ 反代到 ${API_PREFIX}/，前缀对得上" \
         || err "nginx 的 /api/ 没有反代到 ${API_PREFIX}/：前端请求 /api/auth/login，后端却在 ${API_PREFIX}/auth/login，全站 API 404"
-    # 前端 dev server 的 rewrite 是同一份契约，三方（前端 dev / nginx / 后端）要一致
     for p in musicplayer musicman; do
         [ -f "$p/vite.config.ts" ] || continue
         grep -qF "replace(/^\\/api/, '${API_PREFIX}')" "$p/vite.config.ts" \
@@ -385,10 +362,6 @@ else
 fi
 
 echo "== 静态分发路径（音频 /music internal vs 封面 /media public）"
-# 读 nginx 里所有 `location ^~ /xxx/` 及其中是否标了 internal
-# ⚠️ 必须在块结束时清空 cur：`location = /50x.html { ... internal; }` 里那个
-#    internal 不属于任何 ^~ location，不问青红皂白地算给"上一个"会把
-#    /media/ 误判成 internal（本断言第一次跑就踩了这个坑）。
 LOCS=$(awk '
     /^[[:space:]]*location[[:space:]]+\^~[[:space:]]+/ {
         l = $0
@@ -401,7 +374,6 @@ LOCS=$(awk '
     END { for (k in seen) print k "\t" ((k in intern) ? "internal" : "public") }
 ' docker/nginx/conf.d/music.conf | sort)
 
-# 后端拼的 X-Accel 前缀（compose 里那个变量）
 SP=$(sed -n 's/^[[:space:]]*MUSIC_STATIC_PREFIX:[[:space:]]*\([^[:space:]#]*\).*/\1/p' docker-compose.yml | head -n 1 | tr -d '"')
 case "${SP}" in
     "") err "compose 里没有 MUSIC_STATIC_PREFIX（后端默认值是不带结尾斜杠的 /music，会拼出 /musicArtist/...）" ;;
@@ -415,7 +387,7 @@ if [ -n "${SP}" ]; then
         err "music.conf 里没有 ${SP} 的 internal location：X-Accel-Redirect 找不到落点，会退回 location / 的 SPA 兜底（200 + HTML，播放器报解码错误）"
     fi
 fi
-# 封面必须是【公开】的静态路径（请求来自浏览器 <img>，不是后端放行）
+
 if printf '%s\n' "${LOCS}" | grep -qF "$(printf '/media/\tpublic')"; then
     ok "/media/ 是公开静态（播放器的 <img src=\"/media/...\"> 能直连）"
 else
@@ -427,21 +399,8 @@ MEDIA_ALIAS=$(awk '
 ' docker/nginx/conf.d/music.conf)
 MEDIA_ALIAS_N="$(printf '%s' "${MEDIA_ALIAS}" | sed 's:/$::')"    # 去尾斜杠便于比对
 
-# ---- 封面落点：nginx 的 /media/ alias 是在【web 容器里】解析的 ----
-# 所以 web 必须把宿主目录挂到「覆盖这张 alias 指向的路径」的容器位置，
-# 否则 nginx 老老实实回 404 —— 封面全裂图，而日志里只有 nginx 的 404，最难查。
-#
-# 自「不再使用独立 ARTWORK_DIR」之后，宿主上 artwork 就是 MEDIA_DIR/artwork，
-# 于是 web 有两种合法挂法，本检查都接受：
-#   ① 只挂封面子目录： <宿主>/artwork -> /var/lib/musicbase/media/artwork
-#   ② 挂整个媒体根：   <宿主>         -> /var/lib/musicbase/media
-# 两者都必须 :ro（web 只做分发，写操作一律走 API）。
 MEDIA_ROOT_C=/var/lib/musicbase/media
-# artwork 子目录名不靠猜：后端 config.py 里 ARTWORK_DIR = MEDIA_ROOT / '<name>'，
-# 直接把那个名字读出来（子项目没挂载时退回默认名 artwork）。
-# ⚠️ 末尾的 `|| true` 不能省：脚本开头是 `set -e` + `pipefail`，子项目没挂载时
-#    第一个 grep 找不到文件会返回 1，整条管道随之非零 —— 赋值语句就会直接终止脚本
-#    （本文件里其它「从源码里读事实」的赋值也都带 `|| true`，同一个理由）。
+
 ART_SUB="$(grep -A3 -E 'def ARTWORK_DIR\(' musicbase/app/core/config.py 2>/dev/null \
     | grep -oE "MEDIA_ROOT[[:space:]]*/[[:space:]]*['\"][^'\"]+['\"]" \
     | head -n 1 | sed -E "s#.*/[[:space:]]*['\"]([^'\"]+)['\"]\$#\1#" || true)"
@@ -475,20 +434,18 @@ elif [ "${mount_kind}" = "exact" ]; then
 else
     ok "/media/ 的 alias(${MEDIA_ALIAS}) 落在 web 挂载的 ${MEDIA_ROOT_C} 之下"
 fi
-# web 侧必须是只读：放开写等于绕过后端的鉴权与目录校验
+
 if [ -n "${mount_kind}" ] && ! printf '%s\n' "${mount_line}" | grep -qE ':ro$'; then
     err "web 的媒体挂载不是只读：${mount_line}
        web 只做分发，写操作一律走 API；可写挂载会让容器绕过鉴权改动媒体文件。"
 fi
 
-# ARTWORK_DIR 已废弃：后端 ARTWORK_DIR 是只读 property（= MEDIA_ROOT/artwork），
-# 宿主侧就用 MEDIA_DIR/artwork，compose 不该再出现这个自变量。
 if sed 's/#.*//' docker-compose.yml | grep -q "ARTWORK_DIR"; then
     err "compose 里仍有未注释的 ARTWORK_DIR：它会让 artwork 出现第二个落点（且可能与 MEDIA_DIR/artwork 相互遮蔽）"
 else
     ok "compose 不再使用独立的 ARTWORK_DIR（artwork 统一落在 MEDIA_DIR/artwork）"
 fi
-# 后端 artwork 的挂载路径就是 /media/{artists,albums,tracks,playlists}，两边要对齐
+
 if [ -f musicbase/app/main.py ]; then
     n_mount=$(sed 's/#.*//' musicbase/app/main.py | grep -cE "app\.mount\('/media/" || true)
     if [ "${n_mount}" -ge 1 ]; then
@@ -525,9 +482,6 @@ if [ -f .env ]; then
         if [ -d "$d" ]; then ok "$v 存在 ($d)"; else err "$v 目录不存在: $d"; fi
     done
 
-    # 同文件系统检查：归档是 shutil.move，跨设备时它不会报错，而是静默降级成
-    # 「复制后删除」——大文件慢，复制中途失败还会在音乐库里留半个文件。
-    # 这类问题只在运行时才暴露，且现象是「归档偶尔留残file」，极难归因，所以前置拦截。
     if [ -d "${MUSIC_DIR:-}" ] && [ -d "${MEDIA_DIR:-}" ]; then
         if [ "$(uname -s)" = "Linux" ]; then
             dev_music=$(stat -c '%d' "${MUSIC_DIR}" 2>/dev/null || echo "?")
@@ -546,7 +500,6 @@ if [ -f .env ]; then
         fi
     fi
 
-    # ARTWORK_DIR 已废弃（compose 不再引用它），留着会让人以为它还在起作用
     if grep -qE "^ARTWORK_DIR=" .env; then
         echo "  ! .env 里还留着 ARTWORK_DIR，但 compose 已不再引用它"
         echo "    artwork 现在就是 MEDIA_DIR/artwork，删掉这一行即可"
@@ -556,14 +509,6 @@ else
 fi
 
 echo "== 环境变量分层归属"
-# 分层原则（详见 README §5）：每个变量只在一个地方定义，判据是「谁有权改它」
-#   L1 镜像层 Dockerfile ENV —— 换了部署环境也不会变的（解释器行为 / locale / PATH）
-#   L2 编排层 compose environment —— 与 volumes、服务名耦合的契约
-#   L3 部署层 .env -> env_file —— 换了主机就要重新填的（密钥 / PUID / 调试开关）
-# 越界 = 同一件事在两层都写，改一处忘一处，比不写更危险。
-
-# Dockerfile 的 ENV 常用 `\` 续行折叠成多行，路径/密钥可能落在续行里，
-# 单行 grep 匹配不到 —— 必须先把续行拼回一行再判断。
 fold_continuations() {
     awk '{
         line = $0
@@ -579,7 +524,6 @@ fold_continuations() {
     }' "$1"
 }
 
-# (a) L1 不得越界写编排层的路径（改了 volumes 不会同步改 Dockerfile）
 if fold_continuations docker/backend/Dockerfile | sed 's/#.*//' | grep -qE "^[[:space:]]*(ENV|ARG)[[:space:]]+.*(/music|/var/lib/musicbase|/var/tmp/musicbase)"; then
     err "Dockerfile 里写了容器路径（属于编排层契约，应与 compose 的 volumes 放在一起）"
 else
@@ -591,9 +535,6 @@ else
     ok "Dockerfile 未固化任何密钥"
 fi
 
-# (b) L2 不得重复 L1 已经定好的量（只查 api 服务——db 是 postgres 官方镜像，它有自己的一套）
-# 只取 api 服务的 environment 键（db 是 postgres 官方镜像，变量名自成一套）。
-# dev 覆盖层也要一起扫，否则那边偷偷加的死变量查不出来。
 compose_files=()
 for f in docker-compose.yml docker-compose.dev.yml; do [ -f "$f" ] && compose_files+=("$f"); done
 api_env_keys() {
@@ -616,9 +557,6 @@ while IFS= read -r k; do
 done < <(api_env_keys)
 [ "$l1_dup" = "0" ] && ok "compose 未重复 Dockerfile 的镜像层变量"
 
-# (c) L2 的路径必须与 volumes 挂载点一致（否则容器里指向不存在的目录）
-# 注意：YAML 里的挂载串通常带引号（"...:/music"），比对前先剥掉引号，
-# 否则 ":${p}$" 匹配不到行尾而被误报成「没有挂载点」。
 path_missing=0
 for p in /music /var/lib/musicbase/media /var/lib/musicbase/logs; do
     if ! tr -d "\"'" < docker-compose.yml | grep -q ":${p}\(:\|$\)"; then
@@ -628,9 +566,6 @@ for p in /music /var/lib/musicbase/media /var/lib/musicbase/logs; do
 done
 [ "$path_missing" = "0" ] && ok "编排层路径均在 volumes 中有对应挂载点"
 
-# (d) 配置来源必须分离：env_file 指向后端子项目的 .env，而不是顶层 .env。
-#     指向顶层 .env 会把 MUSIC_DIR/HTTP_PORT/BACKUP_DIR 这类宿主机概念灌进容器，
-#     一旦后端将来新增同名字段，它会静默读到宿主机路径（在容器里根本不存在）。
 if grep -qE "^[[:space:]]*-[[:space:]]*path:[[:space:]]*musicbase/\.env" docker-compose.yml; then
     ok "env_file 指向 musicbase/.env（应用配置与编排参数已分离）"
 elif sed 's/#.*//' docker-compose.yml | grep -qE "^[[:space:]]*-[[:space:]]*\.env[[:space:]]*$"; then
@@ -638,7 +573,7 @@ elif sed 's/#.*//' docker-compose.yml | grep -qE "^[[:space:]]*-[[:space:]]*\.en
 else
     echo "  ! 未识别到 env_file 配置，请确认 api 服务显式声明了它"
 fi
-# 顶层 .env 不该出现只属于后端的应用配置
+
 top_leak=0
 for k in SECRET_KEY ACOUSTID_API_KEY NETEASE_PLAYLIST_API NETEASE_SONG_API APP_NAME MUSIC_FILE_EXTENSIONS; do
     if [ -f .env ] && grep -qE "^${k}=" .env; then
@@ -648,11 +583,6 @@ for k in SECRET_KEY ACOUSTID_API_KEY NETEASE_PLAYLIST_API NETEASE_SONG_API APP_N
 done
 [ "$top_leak" = "0" ] && ok "顶层 .env 未混入后端应用配置"
 
-# (e) 死变量：在 compose 里配了，但没有任何代码读它。
-#     关键：判据必须是【后端 config.py 里真实存在的字段】，不能拿 .env.example
-#     当清单——.env.example 是可以随便写注释和占位名的，照着它写会漏判；
-#     也不能因为 entrypoint 提到了就算数（entrypoint 是我们自己写的，
-#     自己消费自己设的变量同样等于空转）。
 backend_cfg="musicbase/app/core/config.py"
 if [ -f "$backend_cfg" ]; then
     backend_fields="$(
@@ -680,9 +610,6 @@ else
 fi
 
 echo "== 音频指纹工具（fpcalc）"
-# 后端上传流程会用 pyacoustid 生成指纹，pyacoustid 内部执行 fpcalc 可执行文件：
-#     acoustid.py:  fpcalc = os.environ.get(FPCALC_ENVVAR, FPCALC_COMMAND)
-# 所以镜像里必须有它，否则上传时指纹步骤会 NoBackendError。
 BD=docker/backend/Dockerfile
 grep -qE "COPY --from=fpcalc .*/usr/local/bin/fpcalc" "$BD" \
     && ok "fpcalc 已装进镜像 PATH" \
@@ -696,9 +623,7 @@ grep -q "fpcalc -version" "$BD" \
 grep -q "TARGETARCH" "$BD" \
     && ok "fpcalc 按目标架构取二进制（amd64 / arm64）" \
     || echo "  ! 未处理多架构：NAS 若为 arm64 会装到 x86_64 二进制而无法执行"
-# 反模式：apt 的 libchromaprint-tools 会连带装上 libchromaprint.so.1，
-# 使 pyacoustid 的 have_chromaprint 变 True，从而【跳过 fpcalc 改走 audioread 分支】，
-# 而 audioread 还需要 gstreamer 或 ffmpeg 可执行文件才能解码 —— fpcalc 就白装了。
+
 if sed 's/#.*//' "$BD" | grep -qE "apt-get install.*libchromaprint"; then
     err "Dockerfile 用 apt 装了 libchromaprint，会让指纹走 audioread 分支而绕过 fpcalc：
        请改用 chromaprint 官方静态 fpcalc（见 Dockerfile 的 fpcalc stage），
@@ -708,11 +633,6 @@ else
 fi
 
 echo "== 音乐库监控服务（watcher）"
-# 后端有两套 watcher 实现，互斥：
-#   app/background/watcher.py          独立进程 ← 容器里用这个
-#   app/background/watcher_manager.py  进程内，由管理端 /startwatcher 触发（开发用）
-# 同时启用 → 同一个新文件被处理两次 → 重复 Track / 并发写库。
-# （svc_block 定义在文件头部，静态分发那一节也在用）
 if ! grep -qE "^  watcher:" docker-compose.yml; then
     err "compose 里没有 watcher 服务：音乐库变动不会被自动入库（只能手动全量扫描）"
 else
@@ -741,7 +661,7 @@ if [ -f musicbase/app/background/watcher.py ]; then
         echo "  ⚠ watcher.py 里只有 Observer（inotify），WATCH_MODE 配了也不生效："
         echo "    Docker Desktop(Windows/macOS) 的 bind mount 与 NFS/SMB 上收不到 inotify 事件，"
         echo "    容器会正常启动并打印 'Watcher started'，但文件变动永远不触发 —— 静默失效。"
-        echo "    补丁见 README「监控模式」一节（换成 PollingObserver）。"
+        echo "    补丁见 DEVDOC.md §4.5「监控模式」（换成 PollingObserver）。"
     fi
 fi
 if [ -f musicbase/app/api/v1/admin/scan.py ] && grep -q "startwatcher" musicbase/app/api/v1/admin/scan.py; then
@@ -750,9 +670,6 @@ if [ -f musicbase/app/api/v1/admin/scan.py ] && grep -q "startwatcher" musicbase
 fi
 
 echo "== env_file 的解析模式"
-# format: raw 让 Compose 不做 ${} 插值，从而与本地 python-dotenv 的读取行为严格一致
-# （否则同一个带 $ 的 SECRET_KEY，本地跑和容器跑会得到两个不同的值）。
-# 代价是要求 Compose >= 2.30，版本不够会报「未知字段」。
 if grep -qE "format:[[:space:]]*raw" docker-compose.yml; then
     cv="$(docker compose version --short 2>/dev/null | head -1 || true)"
     if [ -z "$cv" ]; then
@@ -780,9 +697,6 @@ if [ -f musicbase/.env ]; then
             || err "$k 在 musicbase/.env 里为空或缺失：config.py 标了必填，后端起不来"
     done
 
-    # 环境相关键在容器内会被 compose 的 environment 覆盖 —— 这不是冗余：
-    # 本地起服务要用 127.0.0.1 和本地路径，容器里必须是 db 和容器内路径，
-    # 一份文件服务两种运行方式，值本来就应该不同。
     n_env=0
     for k in HOST PORT DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME \
              MUSIC_LIBRARY_PATH MEDIA_ROOT LOG_DIR NETEASE_COOKIES_FILE MUSIC_STATIC_PREFIX; do
@@ -798,7 +712,6 @@ else
     err "缺少 musicbase/.env（cp musicbase/.env.example musicbase/.env 后填写 SECRET_KEY 等）"
 fi
 
-# 用后端自己的 .env.example 当清单，逐个核对每个键都有来源
 if [ -f musicbase/.env.example ]; then
     miss=0
     while IFS= read -r line || [ -n "$line" ]; do

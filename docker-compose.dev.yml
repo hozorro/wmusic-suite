@@ -14,7 +14,7 @@ services:
         INSTALL_FFMPEG: "true"
     # 只写「后端 Settings 或 entrypoint 真正会读」的键。
     # 别照抄通用直觉写 ENVIRONMENT / LOG_LEVEL / SQL_ECHO / WATCH_MODE ——
-    # 后端 .env.example 里没有这些字段，配了也不会生效（详见 README §5.7）。
+    # 后端 .env.example 里没有这些字段，配了也不会生效（详见 DEVDOC.md §5.7）。
     environment:
       DEBUG: "true"            # 后端 Settings 有此字段
       RUN_MIGRATIONS: "true"   # entrypoint.sh 消费

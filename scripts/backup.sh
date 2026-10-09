@@ -33,7 +33,6 @@ docker compose exec -T db pg_dump \
     "${POSTGRES_DB:-musicbase}" > "${OUT}/musicbase.sql"
 
 # 媒体根目录：artwork 缓存 + uploads/temp + uploads/staging（可能还有没归档的上传）
-# artwork 就在 MEDIA_DIR/artwork 下面（没有独立的 ARTWORK_DIR 了），所以打这一份就够。
 if [ -d "${MEDIA_DIR:-}" ]; then
     echo "==> 打包媒体目录（artwork / uploads / playlists）: ${MEDIA_DIR}"
     tar -czf "${OUT}/media.tar.gz" -C "${MEDIA_DIR}" .
@@ -42,7 +41,6 @@ else
 fi
 
 # 两份配置都要存：顶层 .env 是编排参数，musicbase/.env 才含 SECRET_KEY。
-# 恢复时按原路径放回，否则要么连不上库，要么起不来服务。
 cp .env            "${OUT}/env.bak"           2>/dev/null || true
 cp musicbase/.env  "${OUT}/musicbase.env.bak" 2>/dev/null || true
 

@@ -1,16 +1,14 @@
-# musicbase-suite 一体化部署栈
+# wmusic-suite 一体化部署栈
 # ---------------------------------------------------------------------------
-# 三个子项目各自保留 git 仓库（以 submodule/subtree 挂载到本仓库根目录），
+# 三个子项目各自保留 git 仓库（以 submodule 挂载到本仓库根目录），
 # 本文件负责把它们编排成一个服务栈：postgres + FastAPI + nginx(双前端)
-#
-# 所有构建上下文都是「本仓库根目录」，方便一个 Dockerfile 里 COPY 多个子项目。
 # 用法：
 #   cp .env.example .env && vim .env
 #   docker compose build
 #   docker compose up -d
 # ---------------------------------------------------------------------------
 
-name: musicbase
+name: wmusic
 
 services:
 
@@ -48,20 +46,12 @@ services:
         max-file: "3"
 
   # ------------------------- FastAPI 后端 musicbase -----------------------
-  # ⚠️ 下面用 YAML 锚点（&api-build / &api-env-file / &api-env / &api-volumes）
-  #    把 api 的「构建 / 配置 / 挂载」定义成模板，watcher 服务直接复用（*xxx）。
-  #    理由：watcher 与 api 是同一份代码、同一份配置。任何一处抄两遍，都会在
-  #    将来某次只改了一边时，出现「两个进程按不同配置运行」的幽灵故障。
-  #    锚点挂在 api 上而不是写成 x- 扩展字段，是为了让本文件里 api 段依旧完全
-  #    字面可读 —— scripts/check.sh 的静态解析依赖这一点。
   api:
     build: &api-build
       context: .
       dockerfile: docker/backend/Dockerfile
       args:
         PYTHON_VERSION: "3.13"
-        # 需要 ffmpeg（转码 / 从视频抽封面 / 生成波形）时改为 true
-        # 注意：音频指纹【不】依赖它 —— fpcalc 是自带静态 FFmpeg 的独立二进制
         INSTALL_FFMPEG: "${INSTALL_FFMPEG:-false}"
         FPCALC_VERSION: "${FPCALC_VERSION:-1.6.1}"
         # 连不上 GitHub 时填加速前缀，例如 https://ghfast.top/https://github.com
@@ -72,82 +62,21 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    # ------------------------------------------------------------------
-    # 配置注入：两份文件，职责互不重叠
-    #
-    #   顶层 .env          ——【编排参数】宿主机路径、端口、数据库凭据、构建开关。
-    #                        只被本文件的 ${} 引用，**不注入任何容器**。
-    #   musicbase/.env     ——【后端应用配置】SECRET_KEY / ACOUSTID_API_KEY /
-    #                        NETEASE_* / DEBUG 等，与后端源码同处一室。
-    #                        经下面的 env_file 进容器，后端 Settings 直接读。
-    #
-    # 后端的真实字段清单见 musicbase/app/core/config.py，别按 .env.example 的
-    # 注释猜字段：那里的 DB_HOST / MUSIC_LIBRARY_PATH 等是「本地开发值」，
-    # 进容器后会被本段 environment 覆盖成容器内视角的值。
-    #
-    # format: raw 让 Compose 不做 ${} 插值，从而与本地 python-dotenv 的读取
-    # 行为严格一致 —— 否则同一个 SECRET_KEY 里带 $ 时，本地跑和容器跑会得到
-    # 两个不同的值。需要 Compose >= 2.30；版本偏低就删掉 format 行，并注意
-    # 值里的 $ 必须写成 $$（只对容器生效，本地反而会多出反斜杠）。
-    # ------------------------------------------------------------------
     env_file: &api-env-file
       - path: musicbase/.env
         format: raw
-    # ------------------------------------------------------------------
-    # 本段【只放两类东西】：
-    #   (a) 值必须为「容器内部视角」的编排契约（路径、服务名、监听地址）
-    #   (b) 需要 compose 插值搬运的部署参数（从顶层 .env 读值再显式送进来）
-    #
-    # 判断标准：这个值换了台主机要不要改？
-    #   要改  -> 放顶层 .env，这里用 ${} 搬运（PUID / TZ / 开关等）
-    #   不改  -> 直接写死在这里（容器路径、DB_HOST=db、HOST=0.0.0.0）
-    # 不属于这两类的一律不写，交给 musicbase/.env。
-    # ------------------------------------------------------------------
-    # 锚点：watcher 服务用 `<<: *api-env` 复用整段，保证两个进程配置永远一致
     environment: &api-env
-      # ---- (a1) 容器内部路径：与下方 volumes 一一对应的契约 ----
       MUSIC_LIBRARY_PATH: /music
-      # ⚠️ MEDIA_ROOT 是「媒体文件根目录」，下列目录全部由它派生，而且是只读
-      #    property —— 想用环境变量单独设 TEMP_DIR / STAGING_DIR / ARTWORK_DIR
-      #    是无效的，后端 config.py 里根本没有这几个字段：
-      #      ARTWORK_DIR       = MEDIA_ROOT/artwork
-      #      TEMP_DIR          = MEDIA_ROOT/uploads/temp        （上传落盘）
-      #      STAGING_DIR       = MEDIA_ROOT/uploads/staging     （待归档暂存区）
-      #      PLAYLISTS_TMP_DIR = MEDIA_ROOT/playlists/tmp
       MEDIA_ROOT: /var/lib/musicbase/media
       LOG_DIR: /var/lib/musicbase/logs          # 默认是 /app/logs，容器重建即丢
       # 必须绝对路径 + 落在持久化卷，否则容器重建后网易云登录态丢失
       NETEASE_COOKIES_FILE: /var/lib/musicbase/media/netease_cookies.json
-      # ---- (a2) 与 nginx 强耦合：X-Accel-Redirect 的内部前缀 ----
-      # stream.py:99 里 inner = MUSIC_STATIC_PREFIX + urllib.parse.quote(track_path)，
-      # 而 track_path 是【相对音乐库】的路径（扫描时写入 rel_path，不带前导斜杠），
-      # 例如 'Artist/Album/a.flac'。
-      #
-      # ⚠️ 两个坑，缺一个就是"能登录、能浏览、一按播放就无声"：
-      #   1) 值【必须】与 music.conf 里的 `location ^~ /music/`（alias /music/）
-      #      完全一致 —— nginx 找不到 location 会把请求交给 `location /`，
-      #      而那里 try_files 兜底到 /index.html，于是浏览器收到的是
-      #      200 + 一坨 HTML，播放器报解码错误而不是 404，最难查。
-      #   2) 值【必须带结尾斜杠】。后端是纯字符串相加，没有补斜杠的逻辑：
-      #         '/music/' + 'Artist/a.flac'  ->  /music/Artist/a.flac   ✓
-      #         '/music'  + 'Artist/a.flac'  ->  /musicArtist/a.flac    ✗
-      #      而后端的默认值恰恰是 '/music'（config.py:76），所以这一行
-      #      不能删、必须显式写，等于把上游默认值的坑在这里堵掉。
-      #
-      # ⚠️ 不能写成 /media/ ：那是【封面】的公开静态路径（见 music.conf 的
-      #    `location ^~ /media/`，对应后端 main.py 里 DEBUG 模式挂载的
-      #    /media/artists|albums|tracks|playlists）。音频与封面共用同一前缀，
-      #    一个 location 就没法 alias 到两个不同的根目录。
       MUSIC_STATIC_PREFIX: /music/
-      # ---- (a3) 服务发现与监听 ----
+      # ---- 服务发现与监听 ----
       HOST: "0.0.0.0"                           # 容器内监听所有网卡（对外端口由 web 的 ports 决定）
       PORT: "8000"                              # 必须与 Dockerfile CMD 的 --port 一致
-      DB_HOST: db                               # 容器内是服务名，绝不能写 127.0.0.1
+      DB_HOST: db
       DB_PORT: "5432"
-      # ⚠️ 刻意不设 DATABASE_URL：后端 config.py 里 scheme 写死
-      #    postgresql+asyncpg，丢给它一个 psycopg 风格的 URL 会直接连不上。
-      #    留空时后端会用下面的 DB_* 自行组装（validator 负责拼接）。
-      # ---- (b) 从顶层 .env 插值搬运的部署参数 ----
       DB_USER: "${POSTGRES_USER:-musicbase}"    # 复用 db 服务的凭据，避免填两遍
       DB_PASSWORD: "${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}"
       DB_NAME: "${POSTGRES_DB:-musicbase}"
@@ -164,74 +93,37 @@ services:
       # 音乐库：宿主机目录 -> /music（可写，因为要做标签编辑、文件整理、归档入库）
       - "${MUSIC_DIR:?请在 .env 中设置 MUSIC_DIR}:/music"
       # 媒体根：artwork / uploads/temp / uploads/staging 都在它下面。
-      # ⚠️ 必须与 MUSIC_DIR 落在【同一物理卷】——归档是 shutil.move，
-      #    跨设备时它会静默降级成「复制后删除」：大文件慢，中断还会留半个文件。
-      #    make check 会用 stat 设备号比对两者，不等就报错。
+      # ⚠️ 必须与 MUSIC_DIR 落在【同一物理卷】
       - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/var/lib/musicbase/media"
-      # ⚠️ 刻意【不再】单独挂 ARTWORK_DIR：artwork 就落在 MEDIA_ROOT/artwork
-      #    （= MEDIA_DIR/artwork），上面那行已经完整覆盖它。多挂一层等于把同一个
-      #    子目录映射两次，还会让「artwork 到底在哪」多出第二个答案。
       - app_data:/var/lib/musicbase/logs
-    # 固定 IP：见文件末尾 networks.musicbase 的说明（避免 api 重启换 IP 后 nginx 502）
+    # 固定 IP
     networks:
       musicbase:
         ipv4_address: ${API_IPV4:-172.28.0.10}
     logging: *default-logging
 
   # --------------- 音乐库文件监控（watcher，独立进程，复用 api 镜像）---------
-  # 后端自带两套互斥的实现，只能选一套跑：
-  #   ① app/background/watcher.py         独立进程  ← 本服务用这个
-  #   ② app/background/watcher_manager.py 进程内，由管理端 /startwatcher 触发（开发用）
-  # watcher.py 的文件头注释写明了这条约定：
-  #   "If use watcher in separated process, ... disable trigger in the frontend."
-  # ⚠️ 两者同时跑 → 同一个新文件被两个 watcher 各处理一遍 → 重复 Track、并发写库。
-  #    所以本服务启用后，管理端【不要】再点"启动监控"（/api/v1/admin/startwatcher）。
-  #
-  # 为什么不塞进 api 容器用 supervisor 管两个进程：
-  #   Docker 本身就是进程管理器。拆成独立服务后，重启策略、日志（docker logs）、
-  #   资源限制、崩溃恢复都是独立的 —— 监控进程卡死不影响 API，反之亦然。
-  #   后端自带的 deploy/supervisor.conf.template 适用于非容器部署，容器里不需要。
   watcher:
     build: *api-build
     image: musicbase/api:${IMAGE_TAG:-latest}
     container_name: musicbase-watcher
     restart: unless-stopped
-    # watcher 收到 SIGTERM 后会先停 observer 再退出（watcher.py 里装了信号处理），
     # 留足时间避免正在处理的文件被半途掐断
     stop_grace_period: 20s
     depends_on:
       db:
         condition: service_healthy
-      # 迁移由 api 负责，watcher 只等它启动即可。
-      # 想更严格可改成 service_healthy，但那要求后端已实现 /healthz（见 README）
       api:
         condition: service_started
-    # ⚠️ 必须覆盖镜像的 CMD。ENTRYPOINT（entrypoint.sh）保持不变，
-    #    所以 PUID/PGID 降权、等库、日志目录创建这些逻辑与 api 完全一致；
-    #    RUN_MIGRATIONS 已在下面关掉，不会重复跑迁移。
     command: ["python", "-m", "app.background.watcher"]
     env_file: *api-env-file
     environment:
       # 与 api 复用同一份配置：watcher 读的是同一套 Settings、同一个数据库、
       # 同一个音乐库和 MEDIA_ROOT，任何一项不一致都会导致两边看到的库不一样
       <<: *api-env
-      # ---- 以下三项是 watcher 与 api 唯一的差异 ----
-      # (1) 迁移只该跑一次，两个容器同时 alembic upgrade head 会互相撞锁
       RUN_MIGRATIONS: "false"
-      # (2) 日志分流。后端 logger.py 用 RotatingFileHandler 写死 app.log，而
-      #     RotatingFileHandler 的轮转【不是多进程安全的】：两个进程写同一个
-      #     文件会丢日志、甚至把彼此的文件句柄轮转掉。给 watcher 单独一个目录，
-      #     最终落在同一个 logs 卷里：.../logs/watcher/app.log
       LOG_DIR: /var/lib/musicbase/logs/watcher
-      # (3) 监控模式。inotify 只在 Linux 直挂真实文件系统时可靠；
-      #     Docker Desktop(Win/Mac) 的 bind mount、以及 NFS/SMB 必须用 polling。
-      #     默认给 polling：它会慢一点，但换任何环境都能工作 —— 而 inotify 在
-      #     这两种场景下【不报错、只是永远不触发】，属于最难查的一类故障。
-      #     ⚠️ 这个变量要生效需要后端先打补丁（watcher.py 目前硬编码 Observer），
-      #     补丁见 README「监控模式」一节 —— 在那之前本项不起作用。
       WATCH_MODE: "${WATCH_MODE:-polling}"
-    # 容器里没有 HTTP 服务，镜像自带的 /healthz 探测必然失败、会一直显示
-    # unhealthy（并在 compose ps 里制造噪音），故关闭；进程存活交给 restart 策略
     healthcheck:
       disable: true
     volumes: *api-volumes
@@ -244,46 +136,11 @@ services:
     build:
       context: .
       dockerfile: docker/web/Dockerfile
-      # ------------------------------------------------------------------
-      # 这里【不再需要】build.extra_hosts。
-      #
-      # 曾经加过 `extra_hosts: ["api=127.0.0.1"]`，是为了让 Dockerfile 末尾那句
-      # `nginx -t` 能解析 upstream 里的 api：nginx 在【解析配置】阶段就解析 upstream
-      # 主机名，而构建容器不在 musicbase-net 里，于是每次 build 都以
-      #     nginx: [emerg] host not found in upstream "api:8000" ... exit code: 1
-      # 结束。实测这条 extra_hosts 并没有真正落到构建容器的 /etc/hosts 上（构建照样
-      # 失败），所以换了个更彻底的做法：构建期【不跑】会碰 upstream 的 nginx -t，
-      # 只跑一个"仅含类型表"的最小配置做自检（不需要 DNS）。详见
-      # docker/web/Dockerfile Stage 3。配置语法交给 nginx 自己在容器启动时校验。
-      #
-      # 留着的代价：一个看起来像有兜底、实际没生效的键，会让人误判"护栏已经在了"。
-      # scripts/check.sh 会拦住它再次出现。
-      # ------------------------------------------------------------------
       args:
         NODE_VERSION: "22"
         NGINX_VERSION: "1.27"
-        # 路由基座，必须与 nginx conf.d/music.conf 中的 location 一致：
-        #   /        -> root  /usr/share/nginx/html/player
-        #   /admin/  -> alias /usr/share/nginx/html/man/
         PLAYER_BASE: "/"
         MAN_BASE: "/admin/"
-        # ------------------------------------------------------------------
-        # 前端的 VITE_* 构建期变量【不在这里配】，全部固定在
-        # docker/web/Dockerfile 里。原因有两条：
-        #
-        # 1) 它们是"两个应用各自的身份常量"，不是部署参数：
-        #      musicplayer -> VITE_CLIENT_TYPE=player / VITE_TOKEN_PREFIX=player_
-        #      musicman    -> VITE_CLIENT_TYPE=admin  / VITE_TOKEN_PREFIX=admin_
-        #                     VITE_BASE_URL=/api/
-        #    同一个 build arg 没法给两个 stage 传不同的值；放进来就得拆成 8 个
-        #    带前缀的变量。更糟的是它制造了第二份副本——一旦有人手滑把两边都
-        #    填成 admin_，两端 token 前缀撞车会互相顶号，而构建期毫无报错。
-        #
-        # 2) 前端仓库的 .env* 被 .dockerignore 的 `**/.env.*` 挡在构建上下文之外，
-        #    镜像里的取值本来就只由 Dockerfile 决定，放 compose 里也是纯冗余。
-        #
-        # 要改就改 docker/web/Dockerfile 顶部那两个 ARG 段（有详细说明）。
-        # ------------------------------------------------------------------
     image: musicbase/web:${IMAGE_TAG:-latest}
     container_name: musicbase-web
     restart: unless-stopped
@@ -293,14 +150,7 @@ services:
     ports:
       - "${HTTP_PORT:-8080}:80"
     volumes:
-      # nginx 只读挂载：音频/封面只做下载分发，写操作一律走 API。
-      # 两个挂载点必须与 music.conf 里的 alias 一一对上：
-      #   /music/  -> alias /music/                              （音频，internal + X-Accel）
-      #   /media/  -> alias /var/lib/musicbase/media/artwork/    （封面，公开静态）
       - "${MUSIC_DIR:?请在 .env 中设置 MUSIC_DIR}:/music:ro"
-      # 封面：不再有独立的 ARTWORK_DIR —— artwork 就是 MEDIA_DIR/artwork，
-      # 所以把整根媒体目录只读挂进来即可（nginx 的 /media/ alias 只暴露其中的
-      # artwork/ 子目录，uploads/ 与 netease_cookies.json 不会被 HTTP 触达）。
       - "${MEDIA_DIR:?请在 .env 中设置 MEDIA_DIR}:/var/lib/musicbase/media:ro"
     networks:
       - musicbase
@@ -308,20 +158,6 @@ services:
 
 # ---------------------------------------------------------------------------
 # 自定义 bridge 网络 + 静态 IPAM
-#
-# 为什么给 api / db 固定 IP：
-#   nginx 的 upstream server 若在配置里写主机名，只会在【nginx 启动时解析一次】，
-#   此后一直用缓存的 IP。而 Docker 容器每次重建都会拿到新 IP，
-#   于是 `docker compose restart api` 之后，nginx 还在连旧 IP -> 502 Bad Gateway，
-#   且只有重启 nginx 容器才能恢复。这是 nginx + Docker DNS 最经典的坑。
-#   把 api 的 IP 钉死后，服务名解析出来的永远是同一个地址，问题从根上消失。
-#
-# 子网选择：默认用了 172.28.0.0/16。若与宿主机上已有网络冲突
-#   （ docker network inspect $(docker network ls -q) | grep Subnet ），
-#   在 .env 里改 MUSICBASE_SUBNET，并相应调整 DB_IPV4 / API_IPV4。
-#
-# ⚠️ 网络配置变更不会热生效：改完必须 docker compose down && docker compose up -d
-#    （compose 检测到网络配置变化会重建网络）
 # ---------------------------------------------------------------------------
 networks:
   musicbase:
@@ -334,5 +170,5 @@ networks:
 
 volumes:
   pgdata:
-  app_data:      # 后端日志（LOG_DIR）；媒体文件不在这里，走 MEDIA_DIR 绑定宿主目录
+  app_data:      # 后端日志（LOG_DIR）
 

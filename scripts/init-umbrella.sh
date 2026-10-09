@@ -8,7 +8,7 @@
 #   方式 B（单一仓库·一次 clone 就齐全）：git subtree
 #       ./scripts/init-umbrella.sh subtree    <musicbase-url> <musicplayer-url> <musicman-url>
 #
-# 说明见 README「仓库整合：submodule vs subtree」
+# 说明见 DEVDOC.md §2「仓库整合：submodule vs subtree」
 # ---------------------------------------------------------------------------
 set -Eeuo pipefail
 

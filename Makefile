@@ -50,7 +50,7 @@ ps:
 logs:
 	$(COMPOSE) logs -f --tail=200
 
-# watcher 的应用日志只写文件（见 README §4.5），所以要进容器 tail，
+# watcher 的应用日志只写文件（见 DEVDOC.md §4.5），所以要进容器 tail，
 # 不能只靠 docker logs。
 logs-watcher:
 	$(COMPOSE) exec watcher tail -f /var/lib/musicbase/logs/watcher/app.log

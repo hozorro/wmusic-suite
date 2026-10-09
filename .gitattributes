@@ -1,0 +1,11 @@
+# 全仓库统一使用 LF 行尾。
+#
+# 为什么必须有这个文件：这些文件会被 COPY 进 Linux 容器。带 CRLF 的
+# docker/backend/entrypoint.sh 会让容器直接起不来 —— 内核读第一行 shebang 时
+# 拿到的是 "#!/usr/bin/env bash\r"，于是去找一个名叫 "bash\r" 的解释器，
+# 报错形如 exec /usr/local/bin/entrypoint.sh: no such file or directory。
+#
+# Windows 上 Git 常默认 core.autocrlf=true，会把工作区写成 CRLF，而 git diff /
+# git status 因为会自动归一化，**完全看不见**这个差异（只有按字节比对才看得出）。
+# 所以不能指望"看一眼 git status"，只能由本文件把行尾钉死。
+* text=auto eol=lf
