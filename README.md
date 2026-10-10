@@ -300,48 +300,7 @@ make backup                                   # 输出到 ${BACKUP_DIR}/<时间�
 
 ## 7. 注意事项（踩坑高发区）
 
-### 7.1 行尾必须是 LF —— CRLF 会让容器起不来，而 git 看不见
-
-本仓库用 `.gitattributes` 把行尾钉成 LF。**别删它。**
-
-原因：`docker/backend/entrypoint.sh` 会被原样 `COPY` 进镜像并作为 ENTRYPOINT 执行。如果它是 CRLF，内核读 shebang 拿到的是 `#!/usr/bin/env bash\r`，于是去找一个名叫 `bash\r` 的解释器，容器启动直接失败：
-
-```
-exec /usr/local/bin/entrypoint.sh: no such file or directory
-```
-
-更坑的是**你从 git 里看不出任何异常**：Windows 上 Git 常默认 `core.autocrlf=true`，`git diff` / `git status` 会自动归一化行尾，工作区明明是 CRLF 也显示"没改动"（只有按字节比对才发现）。
-
-自检已经覆盖：`make check` 的「行尾符」组会逐个文件数 CR 字节。若它报错，按 `git rm --cached -r . && git reset --hard` 重写工作区。另外请把编辑器也设成 LF（这个坑本站就是编辑器存成 CRLF 引入的）。
-
-### 7.2 `db` 不映射端口，是刻意的
-
-PostgreSQL 只该被同网络的容器访问。需要本机 GUI 客户端时，用 §5.2 的 `127.0.0.1:5433` 临时 override —— **千万不要写成 `"5433:5432"`**，那等于把数据库暴露给整个局域网。临时文件用完记得删（它会被 compose 自动合并，而且 `docker-compose.override.yml` 不在 `.gitignore` 里）。
-
-### 7.3 卷名前缀 = compose 项目名；改项目名会"丢数据"
-
-`docker-compose.yml` 顶部是 `name: wmusic`，而卷只声明了 `pgdata` / `app_data`，**没有显式 `name:`** —— 所以实际卷名是 `wmusic_pgdata` / `wmusic_app_data`。
-
-一旦把 `name:` 改成别的（或换目录名、换 `-p` 参数），compose 会去找**新名字的空卷**，于是数据库"看起来丢了"（旧的 `wmusic_pgdata` 还在，只是没被挂载）。改名前先迁移：
-
-```bash
-docker compose down                                   # 先停
-docker volume create <新前缀>_pgdata
-docker run --rm -v wmusic_pgdata:/from -v <新前缀>_pgdata:/to alpine sh -c 'cp -av /from/. /to/.'
-docker compose up -d
-```
-
-想彻底免疫改名，就给卷写死名字：
-
-```yaml
-volumes:
-  pgdata:
-    name: wmusic_pgdata
-  app_data:
-    name: wmusic_app_data
-```
-
-### 7.4 `MUSIC_DIR` 与 `MEDIA_DIR` 必须在同一物理卷
+### 7.1 `MUSIC_DIR` 与 `MEDIA_DIR` 必须在同一物理卷
 
 上传 → 落临时区 → 写标签 → **归档入库**（`shutil.move`）。跨设备时 `move` 会静默降级成"复制后删除"：大文件慢，中途失败还会在音乐库里留下半个文件，而数据库里可能已有记录。
 
@@ -351,39 +310,35 @@ stat -c '%d %n' "$MUSIC_DIR" "$MEDIA_DIR"     # 两行设备号必须相同
 
 `make check` 在 Linux 上会自动查这一条。
 
-### 7.5 子模块跟 `main`，开发在 `dev`
+### 7.2 子模块跟 `main`，开发在 `dev`
 
-`.gitmodules` 里三个子模块都是 `branch = main`，而 `wmusicbase` / `wmusicman` 的活跃分支是 `dev`。后果：
+`.gitmodules` 里三个子模块都是 `branch = main`，因此`git submodule update --remote` 拉到的是 `main`，可能**落后于正在开发的 `dev`**。
 
-- `git submodule update --remote` 拉到的是 `main`，可能**落后于你正在开发的 `dev`**。
-- 你刚 push 到 `dev` 的改动，不合并到 `main` 就永远进不了这个栈的构建。
-
-两条路：要么每轮把 `dev` 合并/快进到 `main` 再 bump 子模块指针；要么把 `.gitmodules` 的 `branch` 改成 `dev`（那样这条栈就跟着开发分支跑，注意它是无人值守部署时，稳定性会下降）。
 
 ```bash
 git submodule status                    # 看每个子模块当前 pin 在哪个 commit
 git -C musicbase log --oneline -1        # 看它实际是哪一版
 ```
 
-### 7.6 `WATCH_MODE` 目前配了也不生效
+### 7.3 `WATCH_MODE` 目前配了也不生效
 
 `watcher.py` 里写死了 `observer = Observer()`（inotify），没有读 `WATCH_MODE`。而 Docker Desktop（Windows / macOS）的 bind mount 与 NFS/SMB 上**收不到 inotify 事件** —— 表现是容器正常启动、日志照打 `Watcher started`，但往音乐库里丢歌永远不入库（静默失效，最难查的一类）。
 
-`make check` 会就此给出警告。要真正生效，得给后端打一个把 `Observer` 换成 `PollingObserver` 的小补丁（见 `DEVDOC.md` §4.5）。在那之前，新歌入库靠管理端手动触发全量扫描兜底。
+`make check` 会就此给出警告。要真正生效，得给后端打一个把 `Observer` 换成 `PollingObserver` 的小补丁（见 `DEVDOC.md` §4.5）。
 
-### 7.7 生产环境不要开 `DEBUG=true`
+### 7.4 生产环境不要开 `DEBUG=true`
 
 `DEBUG=true` 会让后端绕过 nginx 的 `X-Accel-Redirect` 改用 Python 直读文件（音频分发退化，拖动进度条会变差），并改变日志行为。只有 `make dev` 才需要它。
 
-### 7.8 别把 Windows 的 `fpcalc.exe` COPY 进镜像
+### 7.5 别把 Windows 的 `fpcalc.exe` COPY 进镜像
 
 后端仓库根目录下有 `fpcalc.exe` / `libchromaprint.dll` —— 那是 PE 格式，容器里跑了会报 `exec format error`。容器内的 `fpcalc` 由 `docker/backend/Dockerfile` 在构建期下载官方 **linux 静态二进制**（带 sha256 校验），版本由 `FPCALC_VERSION` 控制。`.dockerignore` 已经把它们排除。
 
-### 7.9 nginx 的 `conf.d` 下只允许存在我们的配置
+### 7.6 nginx 的 `conf.d` 下只允许存在我们的配置
 
 基础镜像自带 `/etc/nginx/conf.d/default.conf`，按文件名字典序排在 `music.conf` 之前，会成为 80 端口的**默认 server**，把用 IP 访问的请求全部劫走 —— 症状是 `http://<IP>:8080/` 报 **403** 且 `/healthz` 报 **404**（两个一起出现就是它的签名）。Dockerfile 里已经 `rm -f` 它并做了构建期校验，自己加站点配置时注意别引入第二个 `default_server`。
 
-### 7.10 `/api/` 反代必须补上后端前缀
+### 7.7 `/api/` 反代必须补上后端前缀
 
 后端真实前缀是 `/api/v1`，前端请求 `/api/...`。`music.conf` 里必须是：
 
@@ -395,11 +350,11 @@ location ^~ /api/ {
 
 漏了 `v1` 的表现是"页面能开、一登录就 404"。`make check` 的「API 反代前缀」组会核对。
 
-### 7.11 媒体目录不要只挂一半
+### 7.8 媒体目录不要只挂一半
 
 `web` 需要只读挂载 `${MEDIA_DIR}`，否则 nginx 的 `/media/` 落空 → **封面全裂图**。而音频走 `/music/`（internal + X-Accel），前缀与 `MUSIC_STATIC_PREFIX=/music/` 必须一致，对不上时播放器会拿到 `200 + HTML`（静默解码错误，比 404 难查得多）。`make check` 的「静态分发路径」组逐条核对这几个落点。
 
-### 7.12 其它
+### 7.9 其它
 
 - **`restore.sh` 会 drop 数据库**，跑之前确认目标是对的。
 - **首次构建慢**：`fpcalc` 从 GitHub release 下载，被墙就设 `FPCALC_MIRROR`。
